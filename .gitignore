@@ -1,0 +1,7 @@
+*.session
+*.session-journal
+found_results.txt
+found_bots.txt
+__pycache__/
+*.pyc
+.env
