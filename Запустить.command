@@ -10,4 +10,10 @@ if [[ ! -x .venv/bin/python ]]; then
     print "Сначала установите программу по инструкции в README.md."
     exit 1
 fi
+if [[ "$OSTYPE" == darwin* && -r .local/python_arch ]]; then
+    read -r tg_contacts_arch < .local/python_arch
+    if [[ "$tg_contacts_arch" == arm64 || "$tg_contacts_arch" == x86_64 ]]; then
+        exec /usr/bin/arch -"$tg_contacts_arch" .venv/bin/python app.py
+    fi
+fi
 exec .venv/bin/python app.py

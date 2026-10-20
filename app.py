@@ -3,16 +3,19 @@ import json
 import queue
 import subprocess
 import sys
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from tgsearch.backend import Backend
-from tgsearch.engine import Contact, Evidence, SearchOptions
+from tgsearch.engine import Contact, Evidence, SearchOptions, contact_from_dict, filtered_contacts, recover_latest_report
 from tgsearch.extraction import PRESETS, ROLE_FILTERS
 from tgsearch.history import ContactHistory
-from tgsearch.storage import PRIVATE, RESULTS, export_csv, export_txt, load_config, prepare_storage
+from tgsearch.storage import PRIVATE, RESULTS, atomic_text, export_csv, export_txt, load_config, prepare_storage
+from tgsearch.control import Cooldown, session_lock
+from tgsearch.maintenance import clear_history, obsolete_reports, remove_reports, encrypt_backup
 
 BG = "#f2f5f8"
 INK = "#172d43"
@@ -37,7 +40,14 @@ class Application(tk.Tk):
         self.minsize(1080, 740)
         self.configure(bg=BG)
         self.backend = Backend()
-        self.config_data = load_config()
+        self.startup_error = ''
+        try:
+            self.config_data = load_config()
+        except ValueError as exc:
+            self.config_data = {}
+            self.startup_error = str(exc)
+        self.export_request = None
+        self.export_busy = False
         self.history = ContactHistory(PRIVATE / "contacts.sqlite3", PRIVATE / "reports")
         self.authorized = False
         self.running = False
@@ -51,6 +61,9 @@ class Application(tk.Tk):
         self.restored_results = False
         self.build_style()
         self.build_ui()
+        self.after(1000, self.refresh_cooldown)
+        if self.startup_error:
+            self.auth_state.set(self.startup_error)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(100, self.poll)
         if self.config_data.get("api_id"):
@@ -89,12 +102,23 @@ class Application(tk.Tk):
         self.tabs.add(self.login_tab, text="Вход в Telegram")
         self.build_login()
         self.build_search()
+        self.build_data_settings()
         ttk.Label(self, text="Ники проверяются на существование. Роли из текста — подсказка; скрытые владельцы и полный охват Telegram недоступны.", style="Hint.TLabel").pack(anchor="w", padx=24, pady=(4, 10))
         self.tabs.select(self.login_tab)
 
     def build_login(self):
-        panel = ttk.Frame(self.login_tab)
-        panel.pack(anchor="n", fill="x")
+        scroller = ttk.Frame(self.login_tab)
+        scroller.pack(fill='both', expand=True)
+        canvas = tk.Canvas(scroller, bg=BG, highlightthickness=0)
+        self.login_canvas = canvas
+        bar = ttk.Scrollbar(scroller, orient='vertical', command=canvas.yview)
+        bar.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        canvas.configure(yscrollcommand=bar.set)
+        panel = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=panel, anchor='nw')
+        panel.bind('<Configure>', lambda event: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(window, width=event.width))
         ttk.Label(panel, text="Подключите свой Telegram", font=("Helvetica Neue", 21, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(panel, text="Код и пароль вводятся только в этом локальном окне. После входа сессия сохраняется на компьютере.", wraplength=900).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 20))
         self.phone = tk.StringVar(value=self.config_data.get("phone", ""))
@@ -115,12 +139,14 @@ class Application(tk.Tk):
         self.password_button = ttk.Button(panel, text="3. Подтвердить пароль", command=self.password_sign_in)
         self.password_button.grid(row=7, column=1, sticky="w", pady=(3, 12))
         ttk.Label(panel, textvariable=self.auth_state, wraplength=900, foreground="#186e8c").grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 18))
-        details = ttk.LabelFrame(panel, text="API-настройки — сохранены только на этом компьютере", padding=12)
+        details = ttk.LabelFrame(panel, text="API Hash хранится в macOS Keychain", padding=12)
         details.grid(row=9, column=0, columnspan=2, sticky="ew")
         ttk.Label(details, text="API ID").grid(row=0, column=0, sticky="w", padx=(0, 12))
         ttk.Entry(details, textvariable=self.api_id, width=14).grid(row=0, column=1, sticky="w", padx=(0, 25))
         ttk.Label(details, text="API Hash").grid(row=0, column=2, sticky="w", padx=(0, 12))
         ttk.Entry(details, textvariable=self.api_hash, width=40, show="•").grid(row=0, column=3, sticky="w")
+        self.apply_api_button = ttk.Button(details, text="Сохранить API", command=self.apply_api)
+        self.apply_api_button.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
         self.logout_button = ttk.Button(panel, text="Выйти из аккаунта на этом компьютере", command=self.logout)
         self.logout_button.grid(row=10, column=0, columnspan=2, sticky="w", pady=15)
         self.set_auth_busy(False)
@@ -156,15 +182,25 @@ class Application(tk.Tk):
         self.city = tk.StringVar()
         self.roles = tk.StringVar(value=next(iter(ROLE_FILTERS)))
         self.chat_type = tk.StringVar(value="Все")
-        self.max_chats = tk.StringVar(value="50")
-        self.posts = tk.StringVar(value="30")
+        self.max_chats = tk.StringVar(value="30")
+        self.posts = tk.StringVar(value="15")
         self.min_members = tk.StringVar(value="0")
+        self.max_new = tk.StringVar(value="100")
+        self.max_operations = tk.StringVar(value="300")
+        self.cache_hours = tk.StringVar(value="24")
+        self.retention_days = tk.StringVar(value="30")
+        self.limit_mode = tk.StringVar(value="Остановить и сохранить")
+        self.force_refresh = tk.BooleanVar(value=False)
+        self.cooldown_status = tk.StringVar(value="Ограничение Telegram не зарегистрировано")
+        self.api_stats = tk.StringVar(value="API-операций: 0 · Ошибок API: 0")
+        self.export_role = tk.StringVar(value="Все типы")
+        self.export_confidence = tk.StringVar(value="Любая достоверность")
         self.admins = tk.BooleanVar(value=True)
         self.bots = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Для поиска войдите в Telegram")
         self.stats = tk.StringVar(value=f"Новых: 0 · Найдено: 0 · В базе: {self.history.total()}")
         self.filter_widgets = []
-        ttk.Label(left, text="Настройки поиска", font=("Helvetica Neue", 16, "bold")).pack(anchor="w", pady=(0, 10))
+        ttk.Label(left, text="Настройки поиска и ограничения", font=("Helvetica Neue", 14, "bold")).pack(anchor="w", pady=(0, 10))
         self.field_label(left, "Тема")
         combo = self.combo(left, self.topic, list(PRESETS))
         combo.bind("<<ComboboxSelected>>", self.change_topic)
@@ -198,6 +234,22 @@ class Application(tk.Tk):
             widget = ttk.Checkbutton(left, text=label, variable=variable)
             widget.pack(anchor="w", pady=(7, 0))
             self.filter_widgets.append(widget)
+        for label, variable, high in [("Максимум новых контактов", self.max_new, 10000),
+                                      ("Максимум API-операций", self.max_operations, 10000),
+                                      ("Кеш описаний, часов (0 — обновлять)", self.cache_hours, 8760)]:
+            self.field_label(left, label)
+            widget = ttk.Spinbox(left, from_=0 if variable is self.cache_hours else 1, to=high, textvariable=variable)
+            widget.pack(fill="x")
+            self.filter_widgets.append(widget)
+        self.field_label(left, "При ограничении Telegram")
+        self.combo(left, self.limit_mode, ["Остановить и сохранить", "Остановить и показать уведомление"])
+        force = ttk.Checkbutton(left, text="Принудительно обновить описания", variable=self.force_refresh)
+        force.pack(anchor="w", pady=7)
+        self.filter_widgets.append(force)
+        self.refresh_button = ttk.Button(left, text="Обновить кеш при следующем поиске", command=self.refresh_cache)
+        self.refresh_button.pack(fill="x", pady=4)
+        self.filter_widgets.append(self.refresh_button)
+        ttk.Label(left, text="Лимиты задают объём работы и не гарантируют отсутствие ограничений Telegram.", wraplength=305, style="Hint.TLabel").pack(anchor="w", pady=5)
         self.field_label(left, "Свои группы / каналы (необязательно)")
         self.sources = self.text_input(left, 2)
         ttk.Label(left, text="@канал или t.me/канал, через запятую.\nГород проверяется по названию и описанию.", style="Hint.TLabel").pack(anchor="w", pady=(5, 8))
@@ -207,19 +259,25 @@ class Application(tk.Tk):
         self.start_button.pack(side="left", fill="x", expand=True)
         self.stop_button = ttk.Button(actions, text="Стоп", command=self.stop_search, state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
+        self.resume_button = ttk.Button(left_panel, text="Продолжить незавершённый поиск", command=lambda: self.start_search(resume=True), state="disabled")
+        self.resume_button.pack(fill="x", pady=(6, 0))
+        ttk.Label(left_panel, textvariable=self.cooldown_status, wraplength=325, style="Hint.TLabel").pack(fill="x", pady=(5, 0))
         ttk.Label(right, textvariable=self.stats, font=("Helvetica Neue", 16, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
         ttk.Label(right, textvariable=self.status, wraplength=650, style="Hint.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 10))
         table_frame = ttk.Frame(right)
         table_frame.grid(row=2, column=0, sticky="nsew")
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
+        ttk.Label(table_frame, textvariable=self.api_stats, style="Hint.TLabel", wraplength=650).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        table_frame.rowconfigure(1, weight=1)
+        table_frame.rowconfigure(0, weight=0)
         self.table = ttk.Treeview(table_frame, columns=("username", "state", "role", "source"), show="headings", selectmode="browse", height=7)
-        for name, label, width in [("username", "Ник", 145), ("state", "Выгрузка", 85), ("role", "Роль по источнику", 200), ("source", "Группа / канал", 180)]:
+        for name, label, width in [("username", "Ник", 145), ("state", "Статус", 120), ("role", "Тип / достоверность", 200), ("source", "Группа / канал", 180)]:
             self.table.heading(name, text=label)
             self.table.column(name, width=width, minwidth=90)
-        self.table.grid(row=0, column=0, sticky="nsew")
+        self.table.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
         self.table.configure(yscrollcommand=scrollbar.set)
         self.table.bind("<<TreeviewSelect>>", self.show_evidence)
         self.table.bind("<Double-1>", self.open_contact)
@@ -230,8 +288,15 @@ class Application(tk.Tk):
         self.progress.grid(row=5, column=0, sticky="ew", pady=(12, 8))
         self.log_text = self.output_text(right, 6)
         self.log_text.grid(row=6, column=0, sticky="ew")
+        export_filters = ttk.Frame(right)
+        export_filters.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(export_filters, text="Экспорт:").pack(side="left")
+        ttk.Combobox(export_filters, textvariable=self.export_role, state="readonly", width=25,
+                     values=["Все типы", "Подтверждённый создатель", "Администратор", "Предполагаемый владелец", "Другой контакт"]).pack(side="left", padx=5)
+        ttk.Combobox(export_filters, textvariable=self.export_confidence, state="readonly", width=24,
+                     values=["Любая достоверность", "Подтверждено API", "Упоминания в тексте"]).pack(side="left")
         buttons = ttk.Frame(right)
-        buttons.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        buttons.grid(row=8, column=0, sticky="ew", pady=(10, 0))
         self.open_button = ttk.Button(buttons, text="Открыть TXT", command=self.open_result, state="disabled")
         self.open_button.pack(side="left")
         self.save_button = ttk.Button(buttons, text="Сохранить TXT как…", command=self.save_as, state="disabled")
@@ -244,10 +309,118 @@ class Application(tk.Tk):
         self.add_log(f"В истории {self.history.total()} аккаунтов. TXT и CSV нового поиска содержат только новые контакты.")
         self.restore_search_settings()
 
+    def apply_api(self):
+        if self.running or self.auth_busy:
+            return
+        self.set_auth_busy(True)
+        # Read Tk variables on the UI thread, before scheduling.
+        api_id, api_hash = self.api_id.get().strip(), self.api_hash.get().strip()
+        async def save():
+            await self.backend.configure_client(api_id, api_hash)
+            return True
+        self.backend.submit(save(), 'api_configured')
+
+    def refresh_cache(self):
+        self.force_refresh.set(True)
+        self.add_log('Следующий поиск заново получит описания сообществ.')
+
+    def update_actions(self):
+        blocked = self.running or not self.authorized
+        try:
+            blocked = blocked or bool(Cooldown(PRIVATE).remaining())
+            unfinished = self.history.unfinished() is not None
+        except Exception:
+            blocked, unfinished = True, False
+        self.start_button.configure(state='disabled' if blocked else 'normal')
+        self.resume_button.configure(state='normal' if unfinished and not blocked else 'disabled')
+        for button in getattr(self, 'data_buttons', []):
+            button.configure(state='disabled' if self.running else 'normal')
+
+    def refresh_cooldown(self):
+        try:
+            seconds = Cooldown(PRIVATE).remaining()
+            self.cooldown_status.set(f'Ограничение Telegram: осталось {seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}' if seconds else 'Ограничение Telegram не зарегистрировано')
+            self.update_actions()
+        except Exception as exc:
+            self.cooldown_status.set(str(exc))
+        if not self.closing:
+            self.after(1000, self.refresh_cooldown)
+
+    def build_data_settings(self):
+        tab = ttk.Frame(self.tabs, padding=24)
+        self.tabs.add(tab, text='Данные и хранение')
+        ttk.Label(tab, text='Данные остаются на этом Mac', font=('Helvetica Neue', 20, 'bold')).pack(anchor='w', pady=(0, 12))
+        ttk.Label(tab, text='API Hash и ключ шифрования сессии находятся в Keychain. Сессия на диске зашифрована.\nИстория и TXT/CSV содержат публичные контакты и доступны вашей учётной записи macOS.', wraplength=900).pack(anchor='w')
+        ttk.Label(tab, text='Хранить промежуточные отчёты, дней').pack(anchor='w', pady=(18, 5))
+        ttk.Spinbox(tab, from_=1, to=3650, textvariable=self.retention_days, width=12).pack(anchor='w')
+        self.data_buttons = []
+        for label, action in [('Удалить устаревшие промежуточные отчёты…', self.cleanup_reports),
+                              ('Удалить локальную историю и отчёты…', self.clear_data),
+                              ('Зашифровать резервную копию…', self.protect_backup)]:
+            button = ttk.Button(tab, text=label, command=action)
+            button.pack(anchor='w', pady=(12, 0))
+            self.data_buttons.append(button)
+        ttk.Label(tab, text='Очистка требует подтверждения. Отдельные TXT/CSV и старые резервные копии сохраняются.\nВосстановление зашифрованной сессии требует исходного Keychain этого Mac.\nНа SSD/APFS удаление файла не гарантирует стирания копий в снимках диска.', wraplength=900, style='Hint.TLabel').pack(anchor='w', pady=20)
+
+    def cleanup_reports(self):
+        if self.running:
+            return
+        try:
+            days = int(self.retention_days.get())
+            if not 1 <= days <= 3650:
+                raise ValueError('Укажите срок 1–3650 дней.')
+            paths = obsolete_reports(PRIVATE, days)
+            if messagebox.askyesno('Удаление отчётов', f'Удалить {len(paths)} завершённых промежуточных отчётов старше {days} дней? Последний отчёт, незавершённые поиски, история и TXT/CSV сохранятся.', parent=self):
+                remove_reports(paths, PRIVATE, confirmed=True)
+                self.add_log(f'Удалено отчётов: {len(paths)}.')
+            self.save_retention(days)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror('Очистка', str(exc), parent=self)
+
+    def save_retention(self, days):
+        path = PRIVATE / 'search_settings.json'
+        try:
+            settings = json.loads(path.read_text())
+        except FileNotFoundError:
+            settings = {}
+        settings['retention_days'] = days
+        atomic_text(path, json.dumps(settings, ensure_ascii=False, indent=2))
+
+    def clear_data(self):
+        if self.running:
+            return
+        if not messagebox.askyesno('Удалить историю?', 'Удалить всю SQLite-историю, контрольные точки и локальные JSON-отчёты? Следующий поиск снова сочтёт эти аккаунты новыми. Вход, API-настройки, ограничение Telegram и отдельные TXT/CSV останутся.', parent=self):
+            return
+        try:
+            clear_history(PRIVATE, confirmed=True)
+            self.history = ContactHistory()
+            self.contacts.clear()
+            self.table.delete(*self.table.get_children())
+            self.last_path = None
+            self.restored_results = True
+            self.set_running(False)
+            self.stats.set('История очищена · В базе: 0')
+        except (OSError, ValueError) as exc:
+            messagebox.showerror('Очистка', str(exc), parent=self)
+
+    def protect_backup(self):
+        if self.running:
+            return
+        source = filedialog.askopenfilename(parent=self, title='Выберите резервную копию для шифрования')
+        if not source:
+            return
+        destination = filedialog.asksaveasfilename(parent=self, title='Сохранить зашифрованную копию', initialfile=Path(source).name + '.enc', defaultextension='.enc')
+        if destination:
+            try:
+                encrypt_backup(source, destination)
+                messagebox.showinfo('Копия защищена', 'Зашифрованная копия сохранена. Для восстановления нужен исходный Keychain. Исходный архив сохранён; при необходимости удалите его отдельно.', parent=self)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror('Резервная копия', str(exc), parent=self)
+
     def restore_search_settings(self):
         try:
             settings = json.loads((PRIVATE / "search_settings.json").read_text(encoding="utf-8"))
-            for field in ("topic", "city", "roles", "chat_type", "max_chats", "posts", "min_members"):
+            for field in ("topic", "city", "roles", "chat_type", "max_chats", "posts", "min_members", "max_new", "max_operations", "cache_hours", "retention_days", "limit_mode"):
                 if field in settings:
                     getattr(self, field).set(settings[field])
             self.admins.set(settings.get("check_admins", True))
@@ -265,15 +438,17 @@ class Application(tk.Tk):
             return
         self.restored_results = True
         try:
+            recover_latest_report(self.history)
             pointer = json.loads((PRIVATE / "last_search.json").read_text(encoding="utf-8"))
             report_path = Path(pointer["report"]).resolve()
             if not report_path.is_relative_to((PRIVATE / "reports").resolve()):
                 return
             report = json.loads(report_path.read_text(encoding="utf-8"))
             for row in report["contacts"]:
-                contact = Contact(row["username"], row["user_id"], row.get("bot", False),
-                                  [Evidence(**item) for item in row["evidence"]], row.get("is_new", True))
+                contact = contact_from_dict(row)
                 self.handle_event("contact", contact)
+            for item in report.get('pending', []):
+                self.handle_event('pending', item)
             self.last_path = Path(report["file"])
             self.handle_event("stats", report["stats"])
             self.set_running(False)
@@ -319,6 +494,7 @@ class Application(tk.Tk):
         self.qr_button.configure(state="disabled" if busy or self.authorized or self.running else "normal")
         self.code_button.configure(state="normal" if not busy and self.auth_stage == "code" and not self.authorized else "disabled")
         self.password_button.configure(state="normal" if not busy and self.auth_stage == "password" and not self.authorized else "disabled")
+        self.apply_api_button.configure(state="disabled" if busy or self.running else "normal")
         self.logout_button.configure(state="normal" if self.authorized and not busy and not self.running else "disabled")
 
     def request_code(self):
@@ -405,18 +581,25 @@ class Application(tk.Tk):
         self.set_auth_busy(True)
         self.backend.submit(self.backend.logout(), "logged_out")
 
-    def start_search(self):
-        if self.running:
+    def start_search(self, resume=False):
+        if self.running or self.export_busy:
             return
         try:
+            Cooldown(PRIVATE).check()
             options = SearchOptions(self.keywords.get("1.0", "end").strip(), ROLE_FILTERS[self.roles.get()],
                                     self.city.get().strip(), self.chat_type.get(), int(self.max_chats.get()),
                                     int(self.posts.get()), int(self.min_members.get()), self.admins.get(),
-                                    self.bots.get(), self.sources.get("1.0", "end").strip())
+                                    self.bots.get(), self.sources.get("1.0", "end").strip(),
+                                    max_new=int(self.max_new.get()), max_operations=int(self.max_operations.get()),
+                                    cache_hours=float(self.cache_hours.get()), force_refresh=self.force_refresh.get(),
+                                    retention_days=int(self.retention_days.get()), limit_mode=self.limit_mode.get())
             options.validate()
-        except (ValueError, KeyError) as exc:
+        except Exception as exc:
             messagebox.showerror("Настройки поиска", str(exc), parent=self)
             return
+        settings = {field: getattr(self, field).get() for field in ("topic", "city", "roles", "chat_type", "max_chats", "posts", "min_members", "max_new", "max_operations", "cache_hours", "retention_days", "limit_mode")}
+        settings.update(keywords=options.keywords, sources=options.sources, check_admins=options.check_admins, include_bots=options.include_bots)
+        atomic_text(PRIVATE / 'search_settings.json', json.dumps(settings, ensure_ascii=False, indent=2))
         self.contacts.clear()
         self.last_path = None
         self.table.delete(*self.table.get_children())
@@ -425,7 +608,7 @@ class Application(tk.Tk):
         self.evidence.configure(state="disabled")
         self.stats.set(f"Новых: 0 · Найдено: 0 · В базе: {self.history.total()}")
         self.set_running(True)
-        self.backend.submit(self.backend.search(options), "finished")
+        self.backend.submit(self.backend.search(options, resume=resume), "finished")
 
     def set_running(self, running):
         self.running = running
@@ -437,6 +620,7 @@ class Application(tk.Tk):
             button.configure(state="disabled" if running or self.last_path is None else "normal")
         self.history_button.configure(state="disabled" if running else "normal")
         self.set_auth_busy(self.auth_busy)
+        self.update_actions()
         if running:
             self.progress.start(12)
             self.status.set("Идёт поиск. В TXT сохраняются только новые аккаунты; история общая для всех тем.")
@@ -498,16 +682,53 @@ class Application(tk.Tk):
             self.set_auth_busy(False)
         elif kind == "log":
             self.add_log(value)
+        elif kind == "api_configured":
+            self.set_auth_busy(False)
+            self.auth_state.set("API-настройки сохранены в Keychain. Проверяю вход…")
+            self.backend.submit(self.backend.restore(), "restored")
+        elif kind == "export_ready":
+            self.export_busy = False
+            request, self.export_request = self.export_request, None
+            if request and value is not None:
+                path, kind_export = request
+                try:
+                    (export_csv if kind_export == 'csv' else export_txt)(path, value)
+                    self.add_log(f"Экспортировано: {len(value)} контактов. {path}")
+                except OSError:
+                    messagebox.showerror('Экспорт', 'Не удалось записать файл. Выберите другую папку.', parent=self)
+            self.set_running(False)
+            if self.closing:
+                self.finish_close()
+        elif kind == "pending":
+            iid = 'pending:' + value['username']
+            values = ('@' + value['username'], 'Проверка не завершена', 'Не подтверждён', value['title'])
+            if self.table.exists(iid):
+                self.table.item(iid, values=values)
+            else:
+                self.table.insert('', 'end', iid=iid, values=values)
         elif kind == "stats":
+            if 'operations' in value:
+                labels = {'discovery': 'поиск', 'descriptions': 'описания', 'publications': 'посты', 'users': 'пользователи', 'admins': 'администраторы'}
+                counts = ' · '.join(f"{labels[k]}: {v}" for k, v in value.get('categories', {}).items())
+                self.api_stats.set(f"API-операций: {value['operations']} · Ошибок API: {value.get('api_errors', 0)}\n{counts}")
+            if value.get('export_check'):
+                return
             if "new" in value:
                 self.stats.set(f"Новых: {value['new']} · Найдено: {value['contacts']} · Сообществ: {value['scanned']}")
             else:
                 self.stats.set(f"В прошлой выгрузке: {value['contacts']} · Сообществ: {value['scanned']}")
+        elif kind == 'contact_checked':
+            current = self.contacts.get(value.user_id)
+            if current:
+                from dataclasses import replace
+                self.handle_event('contact', replace(current, username=value.username, checked_at=value.checked_at, verification=value.verification))
         elif kind == "contact":
             self.contacts[value.user_id] = value
-            roles = list(dict.fromkeys(e.role_label for e in value.evidence))
+            if self.table.exists('pending:' + value.username):
+                self.table.delete('pending:' + value.username)
+            roles = list(dict.fromkeys(e.category for e in value.evidence))
             values = ("@" + value.username + (" [бот]" if value.bot else ""),
-                      "В TXT" if value.is_new else "В базе", "; ".join(roles), value.evidence[0].title)
+                      value.status, "; ".join(roles), value.evidence[0].title if value.evidence else "")
             iid = str(value.user_id)
             if self.table.exists(iid):
                 self.table.item(iid, values=values)
@@ -524,12 +745,19 @@ class Application(tk.Tk):
             self.set_running(False)
             prefix = "Остановлено" if value.cancelled else "Готово"
             self.status.set(value.reason or f"{prefix}. Новых: {len(value.new_contacts)}, уже были: {len(value.contacts) - len(value.new_contacts)}. В базе: {self.history.total()}. TXT содержит только новые.")
-            if value.reason:
+            if value.reason and value.options.limit_mode == "Остановить и показать уведомление":
                 messagebox.showinfo("Ограничение Telegram", value.reason, parent=self)
             if self.closing:
                 self.finish_close()
         elif kind == "error":
             action, message = value
+            if action == 'export_ready':
+                self.export_busy = False
+                self.export_request = None
+                self.set_running(False)
+                if self.closing:
+                    self.finish_close()
+                    return
             if action == "qr_finished":
                 self.close_qr_window()
             if action == "finished":
@@ -552,8 +780,10 @@ class Application(tk.Tk):
         selection = self.table.selection()
         if not selection:
             return
+        if selection[0].startswith('pending:'):
+            return
         contact = self.contacts[int(selection[0])]
-        text = "\n\n".join(f"{e.role_label} · {e.title}\n{e.source}\n{e.excerpt}" for e in contact.evidence)
+        text = "\n\n".join(f"{e.category} · {e.role_label} · {e.method_label}\nID: {contact.user_id} · Проверен: {contact.checked_at or e.checked_at or 'дата неизвестна'}\n{e.title} · {e.community or e.source}\n{e.source}\n{e.excerpt}" for e in contact.evidence)
         self.evidence.configure(state="normal")
         self.evidence.delete("1.0", "end")
         self.evidence.insert("1.0", text)
@@ -561,42 +791,60 @@ class Application(tk.Tk):
 
     def open_contact(self, _event=None):
         selection = self.table.selection()
-        if selection:
+        if selection and not selection[0].startswith("pending:"):
             open_path(f"https://t.me/{self.contacts[int(selection[0])].username}")
 
     def open_result(self):
         if self.last_path:
             open_path(self.last_path)
 
+    def selected_exports(self, full=False):
+        if full:
+            contacts = []
+            for record in self.history.records():
+                contacts.append(Contact(record['username'], record['user_id'], bool(record['bot']),
+                                        [Evidence(**e) for e in record['evidence']], False,
+                                        record['checked_at'], record['verification']))
+        else:
+            contacts = list(self.contacts.values())
+        return list(filtered_contacts(contacts, self.export_role.get(), self.export_confidence.get(), new_only=not full, include_unverified=True))
+
+    def request_export(self, kind='txt', full=False):
+        if self.running or self.export_busy:
+            return
+        path = filedialog.asksaveasfilename(parent=self, title="Сохранить всю базу" if full else "Сохранить новые контакты",
+                    defaultextension='.' + kind, initialfile=('Все_контакты' if full else 'Новые_контакты') + '.' + kind,
+                    initialdir=str(RESULTS), filetypes=[(kind.upper(), '*.' + kind)])
+        if not path:
+            return
+        contacts = self.selected_exports(full)
+        try:
+            hours, maximum = float(self.cache_hours.get()), int(self.max_operations.get())
+            if not 0 <= hours <= 8760 or not 1 <= maximum <= 10000:
+                raise ValueError('Проверьте срок кеша (0–8760) и лимит API (1–10000).')
+            Cooldown(PRIVATE).check()
+        except Exception as exc:
+            messagebox.showerror('Экспорт', str(exc), parent=self)
+            return
+        self.export_request = (path, kind)
+        self.export_busy = True
+        self.set_running(True)
+        self.status.set('Проверяю устаревшие ники перед экспортом. Непроверенные контакты не попадут в файл.')
+        self.backend.submit(self.backend.verify_export(contacts, hours, maximum), 'export_ready')
+
     def save_as(self):
-        path = filedialog.asksaveasfilename(parent=self, title="Сохранить только новые контакты этого поиска", defaultextension=".txt", initialfile="Новые_ники_Telegram.txt", initialdir=str(RESULTS), filetypes=[("Текстовый файл", "*.txt")])
-        if path:
-            try:
-                export_txt(Path(path), (c for c in self.contacts.values() if c.is_new))
-            except OSError as exc:
-                messagebox.showerror("Сохранение", str(exc), parent=self)
-            else:
-                self.add_log(f"Список сохранён: {path}")
+        self.request_export('txt')
 
     def save_csv(self):
-        path = filedialog.asksaveasfilename(parent=self, title="Сохранить источники", defaultextension=".csv", initialfile="Источники_Telegram.csv", initialdir=str(RESULTS), filetypes=[("CSV", "*.csv")])
-        if path:
-            try:
-                export_csv(path, (c for c in self.contacts.values() if c.is_new))
-            except OSError as exc:
-                messagebox.showerror("Сохранение", str(exc), parent=self)
-            else:
-                self.add_log(f"Источники сохранены: {path}")
+        self.request_export('csv')
 
     def save_history(self):
-        path = filedialog.asksaveasfilename(parent=self, title="Сохранить всю накопленную базу контактов", defaultextension=".txt", initialfile="Все_контакты_Telegram.txt", initialdir=str(RESULTS), filetypes=[("Текстовый файл", "*.txt")])
-        if path:
-            try:
-                count = self.history.export_txt(Path(path))
-            except OSError as exc:
-                messagebox.showerror("Сохранение", str(exc), parent=self)
-            else:
-                self.add_log(f"Вся база сохранена: {count} ников. {path}")
+        self.request_export('txt', full=True)
+
+    def report_callback_exception(self, exc_type, exc, tb):
+        from tgsearch.backend import record_error
+        record_error('ui_callback', exc)
+        messagebox.showerror('Telegram Контакты', f'Не удалось выполнить действие ({exc_type.__name__}). Данные сохранены.', parent=self)
 
     def close(self):
         self.closing = True

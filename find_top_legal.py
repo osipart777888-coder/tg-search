@@ -85,7 +85,7 @@ async def main():
         cache = {}
         for index, chat in enumerate(chats[:160], 1):
             try:
-                full = await engine.call(lambda: client(GetFullChannelRequest(chat)))
+                full = await engine.call(lambda: client(GetFullChannelRequest(chat)), 'descriptions')
             except (errors.RPCError, OSError, asyncio.TimeoutError) as exc:
                 engine.warn(f"Аудитория @{chat.username}", exc)
                 continue

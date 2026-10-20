@@ -11,7 +11,9 @@ from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, errors
 
-from .storage import PRIVATE, load_config, save_config
+from .storage import PRIVATE, load_config, save_config, redact
+from .control import Cooldown, SearchPaused, session_lock
+from .security import EncryptedSession, account_lock, session_fingerprint
 
 
 def friendly_error(exc):
@@ -35,12 +37,14 @@ def friendly_error(exc):
     for kind, message in messages.items():
         if isinstance(exc, kind):
             return message
+    if isinstance(exc, SearchPaused):
+        return str(exc)
     if isinstance(exc, errors.FloodWaitError):
         return f"Telegram временно ограничил вход. Попробуйте через {exc.seconds} сек."
     if isinstance(exc, (OSError, asyncio.TimeoutError)):
         return "Не удалось подключиться к Telegram. Проверьте интернет и доступ к Telegram."
     if isinstance(exc, ValueError):
-        return str(exc)
+        return redact(str(exc))
     return f"Не удалось выполнить действие ({type(exc).__name__}). Название ошибки сохранено в локальном журнале. Можно повторить действие; если ошибка повторится, сообщите её название в скобках."
 
 
@@ -84,6 +88,11 @@ def code_delivery_message(sent):
 
 class Backend:
     def __init__(self):
+        import logging
+        # Telethon diagnostics must not format request arguments or session data.
+        logger = logging.getLogger('telethon')
+        logger.handlers = [logging.NullHandler()]
+        logger.propagate = False
         self.events = queue.Queue()
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
@@ -106,6 +115,8 @@ class Backend:
             try:
                 self.emit(action, result.result())
             except Exception as exc:
+                if isinstance(exc, errors.FloodWaitError):
+                    Cooldown(PRIVATE).impose(exc.seconds)
                 record_error(action, exc)
                 self.emit("error", (action, friendly_error(exc)))
 
@@ -118,12 +129,27 @@ class Backend:
             api_hash = config.get("api_hash", "")
             if not api_id.isdigit() or int(api_id) < 1 or not re.fullmatch(r"[a-fA-F0-9]{32}", api_hash):
                 raise ValueError("Укажите действительные API ID и API Hash на вкладке входа.")
-            self.client = TelegramClient(str(PRIVATE / "telegram"), int(api_id), api_hash,
-                                         flood_sleep_threshold=0, request_retries=1,
+            self.session_guard = session_lock(PRIVATE)
+            self.session_guard.__enter__()
+            try:
+                session = EncryptedSession(PRIVATE / 'telegram.session')
+                self.account_guard = account_lock(session)
+                self.account_guard.__enter__()
+                self.account_fingerprint = session_fingerprint(session)
+                self.client = TelegramClient(session, int(api_id), api_hash,
+                                         flood_sleep_threshold=0, request_retries=0, raise_last_call_error=True,
                                          connection_retries=2, retry_delay=1, timeout=15,
-                                         device_model="Telegram Contacts Desktop")
+                                         receive_updates=False, device_model="Telegram Contacts Desktop")
+            except Exception:
+                self.session_guard.__exit__(None, None, None)
+                self.session_guard = None
+                if 'session' in locals():
+                    session.close()
+                raise
         if not self.client.is_connected():
+            Cooldown(PRIVATE).check()
             await asyncio.wait_for(self.client.connect(), timeout=30)
+            self.persist_session()
         return self.client
 
     async def restore(self):
@@ -134,6 +160,7 @@ class Backend:
         me = await asyncio.wait_for(self.client.get_me(), timeout=25)
         if me is None:
             raise ValueError("Вход не завершён. Запросите код ещё раз.")
+        self.persist_session()
         return f"@{me.username}" if me.username else (me.first_name or "Аккаунт подключён")
 
     async def request_code(self, phone, api_id, api_hash):
@@ -143,6 +170,7 @@ class Backend:
         if phone == self.phone and time.monotonic() < getattr(self, "resend_after", 0):
             remaining = int(self.resend_after - time.monotonic()) + 1
             raise ValueError(f"Подождите ещё {remaining} сек. перед повторным запросом. Если код не приходит, используйте вход по QR.")
+        Cooldown(PRIVATE).check()
         client = await self.configure_client(api_id, api_hash, phone)
         if await client.is_user_authorized():
             return {"identity": await self.identity()}
@@ -162,7 +190,7 @@ class Backend:
         config = load_config()
         changed = config.get("api_id") != int(api_id) or config.get("api_hash") != api_hash
         if changed and self.client:
-            await self.client.disconnect()
+            await self.disconnect()
             self.client = None
         config.update(api_id=int(api_id), api_hash=api_hash)
         if phone is not None:
@@ -173,6 +201,7 @@ class Backend:
     async def qr_login(self, api_id, api_hash):
         self.qr_task = asyncio.current_task()
         try:
+            Cooldown(PRIVATE).check()
             client = await self.configure_client(api_id, api_hash)
             if await client.is_user_authorized():
                 return {"identity": await self.identity()}
@@ -221,30 +250,121 @@ class Backend:
         await asyncio.wait_for(self.client.sign_in(password=password), timeout=40)
         return {"identity": await self.identity()}
 
-    async def search(self, options):
+    async def search(self, options, resume=False):
         from .engine import SearchEngine
         self.engine = None
         self.search_task = asyncio.current_task()
         try:
+            Cooldown(PRIVATE).check()
             client = await self.connect()
             if not await client.is_user_authorized():
                 raise ValueError("Сначала войдите в Telegram на вкладке «Вход в Telegram».")
             self.engine = SearchEngine(client, self.emit)
-            return await self.engine.run(options)
+            from .history import ContactHistory
+            checkpoint = ContactHistory().unfinished() if resume else None
+            if resume and checkpoint is None:
+                raise ValueError('Незавершённый поиск не найден.')
+            return await self.engine.run(options, resume=checkpoint)
         except asyncio.CancelledError:
             return None
         finally:
+            self.persist_session()
             self.search_task = None
+
+    async def verify_export(self, contacts, cache_hours=24, maximum=300):
+        self.export_task = asyncio.current_task()
+        try:
+            return await self._verify_export(contacts, cache_hours, maximum)
+        except asyncio.CancelledError:
+            return None
+        finally:
+            self.export_task = None
+
+    async def _verify_export(self, contacts, cache_hours, maximum):
+        from .control import OperationLimiter
+        from .history import ContactHistory, timestamp
+        Cooldown(PRIVATE).check()
+        client = await self.connect()
+        limiter = OperationLimiter(PRIVATE, maximum=maximum)
+        history = ContactHistory()
+        verified = []
+        refreshed, incomplete = [], []
+        try:
+            with session_lock(PRIVATE, 'search.lock'), limiter.bind(client):
+                for contact in contacts:
+                    try:
+                        fresh = bool(contact.checked_at) and time.time() - datetime.fromisoformat(contact.checked_at).timestamp() < cache_hours * 3600
+                    except ValueError:
+                        fresh = False
+                    if fresh and contact.verification == 'verified':
+                        verified.append(contact)
+                        continue
+                    try:
+                        # Resolve by stable ID with the entity access hash retained
+                        # in the encrypted session. Never assign a reused name to
+                        # the old ID merely because it still resolves.
+                        user = await limiter.call(lambda: client.get_entity(contact.user_id), 'users')
+                        if user.id != contact.user_id or getattr(user, 'deleted', False) or not getattr(user, 'username', None):
+                            contact.verification = 'incomplete'
+                            incomplete.append(contact.user_id)
+                            self.emit('contact_checked', contact)
+                            continue
+                        contact.username, contact.checked_at = user.username.lower(), timestamp()
+                        contact.verification = 'verified'
+                        refreshed.append(contact)
+                        verified.append(contact)
+                        self.emit('contact_checked', contact)
+                    except (SearchPaused, errors.RPCError, OSError, asyncio.TimeoutError, ValueError) as exc:
+                        contact.verification = 'incomplete'
+                        incomplete.append(contact.user_id)
+                        self.emit('contact_checked', contact)
+                        if isinstance(exc, SearchPaused):
+                            raise
+                return verified
+        except asyncio.CancelledError:
+            return None
+        finally:
+            history.remember_many(refreshed)
+            history.mark_incomplete(incomplete)
+            self.emit('stats', {'operations': limiter.total, 'api_errors': limiter.errors,
+                                'categories': limiter.counts, 'export_check': True})
+            self.persist_session()
 
     def stop_search(self):
         def cancel():
             if self.search_task and not self.search_task.done():
                 self.search_task.cancel()
+            if getattr(self, 'export_task', None) and not self.export_task.done():
+                self.export_task.cancel()
         self.loop.call_soon_threadsafe(cancel)
 
+    def persist_session(self):
+        if isinstance(getattr(self.client, 'session', None), EncryptedSession):
+            fingerprint = session_fingerprint(self.client.session)
+            if fingerprint != getattr(self, 'account_fingerprint', None):
+                guard = account_lock(self.client.session)
+                guard.__enter__()
+                if getattr(self, 'account_guard', None):
+                    self.account_guard.__exit__(None, None, None)
+                self.account_guard = guard
+                self.account_fingerprint = fingerprint
+            self.client.session.save()
+
     async def disconnect(self):
-        if self.client:
-            await self.client.disconnect()
+        try:
+            if self.client:
+                await self.client.disconnect()
+                self.persist_session()
+                if isinstance(getattr(self.client, 'session', None), EncryptedSession):
+                    self.client.session.close()
+                self.client = None
+        finally:
+            if getattr(self, 'account_guard', None):
+                self.account_guard.__exit__(None, None, None)
+                self.account_guard = None
+            if getattr(self, 'session_guard', None):
+                self.session_guard.__exit__(None, None, None)
+                self.session_guard = None
 
     async def shutdown(self):
         current = asyncio.current_task()
@@ -256,7 +376,8 @@ class Backend:
 
     async def logout(self):
         if self.client:
+            Cooldown(PRIVATE).check()
             await self.client.log_out()
-            self.client = None
+            await self.disconnect()
         self.code_hash = None
         return None

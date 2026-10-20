@@ -3,3 +3,5 @@ pyaes==1.6.1
 rsa==4.9.1
 pyasn1==0.6.4
 qrcode==8.2
+
+cryptography==50.0.2

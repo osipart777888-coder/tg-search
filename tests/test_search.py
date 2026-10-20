@@ -183,6 +183,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.engine.run(self.options())
         self.assertEqual(set(result.contacts), {1, 2, 4})
         self.assertEqual(result.warnings, 1)
+        self.assertTrue(result.complete)
 
     async def test_stop_keeps_contact_found_mid_channel(self):
         waiting = asyncio.Event()
@@ -210,7 +211,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         first_file = first.path.read_bytes()
         self.client.users["freshcontact"] = types.User(500, username="FreshContact")
         self.client.about += "\nПо рекламе: @FreshContact"
-        second = await SearchEngine(self.client, lambda *args: None, request_delay=0).run(self.options())
+        second = await SearchEngine(self.client, lambda *args: None, request_delay=0).run(self.options(force_refresh=True))
         self.assertEqual(second.path.read_text(encoding="utf-8-sig"), "@freshcontact\n")
         self.assertEqual(second.stats()["contacts"], 4)
         self.assertEqual(second.stats()["new"], 1)
@@ -253,7 +254,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("120", result.reason)
         self.assertTrue(result.path.exists())
 
-    async def test_short_flood_wait_retries(self):
+    async def test_short_flood_wait_stops_and_persists_without_retry(self):
         attempts = 0
         async def operation():
             nonlocal attempts
@@ -261,9 +262,14 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             if attempts == 1:
                 raise errors.FloodWaitError(None, capture=1)
             return "ok"
-        result = await self.engine.call(operation)
-        self.assertEqual(result, "ok")
-        self.assertEqual(attempts, 2)
+        from tgsearch.control import SearchPaused, Cooldown
+        with self.assertRaises(SearchPaused):
+            await self.engine.call(operation)
+        self.assertEqual(attempts, 1)
+        self.assertGreater(Cooldown(self.engine.limiter.cooldown.path.parent).remaining(), 0)
+        with self.assertRaises(SearchPaused):
+            await self.engine.call(operation)
+        self.assertEqual(attempts, 1)
 
     def test_bad_options(self):
         for kwargs in ({"max_chats": 0}, {"posts": 101}, {"min_members": -1}, {"sources": "https://t.me/chan/123"}):

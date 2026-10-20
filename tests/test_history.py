@@ -105,16 +105,19 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     def test_gui_export_new_only_and_full_history_are_separate(self):
-        fresh = Contact("freshuser", 200)
-        known = Contact("firstuser", 100, is_new=False)
-        self.history.remember(known)
-        self.history.remember(fresh)
-        view = NS(contacts={100: known, 200: fresh}, history=self.history, add_log=lambda _: None)
-        path = self.root / "new.txt"
-        with patch("app.filedialog.asksaveasfilename", return_value=str(path)):
-            Application.save_as(view)
-        self.assertEqual(path.read_text(encoding="utf-8-sig"), "@freshuser\n")
-        full = self.root / "all.txt"
-        with patch("app.filedialog.asksaveasfilename", return_value=str(full)):
-            Application.save_history(view)
-        self.assertEqual(full.read_text(encoding="utf-8-sig"), "@firstuser\n@freshuser\n")
+        from types import MethodType
+        fresh = Contact("freshuser", 200, evidence=self.contact.evidence)
+        known = Contact("firstuser", 100, evidence=self.contact.evidence, is_new=False)
+        self.history.remember_many([known, fresh])
+        view = NS(contacts={100: known, 200: fresh}, history=self.history,
+                  export_role=NS(get=lambda: 'Все типы'),
+                  export_confidence=NS(get=lambda: 'Любая достоверность'))
+        new = Application.selected_exports(view)
+        full = Application.selected_exports(view, full=True)
+        self.assertEqual([c.username for c in new], ['freshuser'])
+        self.assertEqual(sorted(c.username for c in full), ['firstuser', 'freshuser'])
+        calls = []
+        view.request_export = lambda *a, **kw: calls.append((a, kw))
+        Application.save_as(view)
+        Application.save_history(view)
+        self.assertEqual(calls, [(('txt',), {}), (('txt',), {'full': True})])
