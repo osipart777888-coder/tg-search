@@ -128,6 +128,8 @@ class Application(tk.Tk):
         self.api_hash = tk.StringVar(value=self.config_data.get("api_hash", ""))
         self.auth_state = tk.StringVar(value="Введите номер телефона и запросите код входа.")
         self.phone_entry = self.login_entry(panel, 2, "Номер телефона", self.phone)
+        self.switch_button = ttk.Button(panel, text="Сменить аккаунт", command=self.switch_account)
+        self.switch_button.grid(row=2, column=2, sticky="w", padx=(16, 0), pady=5)
         self.request_button = ttk.Button(panel, text="1. Получить код", command=self.request_code, style="Primary.TButton")
         self.request_button.grid(row=3, column=1, sticky="w", pady=(3, 15))
         self.qr_button = ttk.Button(panel, text="Войти по QR", command=self.start_qr_login)
@@ -581,6 +583,12 @@ class Application(tk.Tk):
 
     def set_auth_busy(self, busy):
         self.auth_busy = busy
+        locked = busy or self.running
+        self.phone_entry.configure(state='disabled' if locked else ('readonly' if self.authorized or self.auth_stage != 'phone' else 'normal'))
+        self.code_entry.configure(state='normal' if not locked and not self.authorized and self.auth_stage == 'code' else 'disabled')
+        self.password_entry.configure(state='normal' if not locked and not self.authorized and self.auth_stage == 'password' else 'disabled')
+        self.switch_button.configure(text='Сменить аккаунт' if self.authorized else 'Другой номер',
+                                     state='normal' if not locked and (self.authorized or self.auth_stage != 'phone') else 'disabled')
         self.request_button.configure(state="disabled" if busy or self.authorized or self.running else "normal")
         self.qr_button.configure(state="disabled" if busy or self.authorized or self.running else "normal")
         self.code_button.configure(state="normal" if not busy and self.auth_stage == "code" and not self.authorized else "disabled")
@@ -659,6 +667,9 @@ class Application(tk.Tk):
 
     def connected(self, identity):
         self.authorized = True
+        active_phone = getattr(self.backend, 'active_phone', '')
+        if active_phone:
+            self.phone.set(active_phone)
         self.auth_state.set(f"Подключён аккаунт {identity}. Можно начинать поиск.")
         self.status.set(f"Telegram подключён: {identity}")
         self.start_button.configure(state="normal")
@@ -669,8 +680,18 @@ class Application(tk.Tk):
         self.restore_last_search()
 
     def logout(self):
+        if self.auth_busy or self.running:
+            return
         self.set_auth_busy(True)
+        self.auth_state.set('Завершаю вход на этом компьютере…')
         self.backend.submit(self.backend.logout(), "logged_out")
+
+    def switch_account(self):
+        if self.auth_busy or self.running:
+            return
+        self.set_auth_busy(True)
+        self.auth_state.set('Завершаю прежний вход, чтобы подключить другой номер…')
+        self.backend.submit(self.backend.logout(), 'account_changed')
 
     def start_search(self, resume=False):
         if self.running or self.export_busy:
@@ -764,13 +785,20 @@ class Application(tk.Tk):
                 self.password_entry.focus_set()
             else:
                 self.connected(value["identity"])
-        elif kind == "logged_out":
+        elif kind in {"logged_out", "account_changed"}:
             self.authorized = False
             self.auth_stage = "phone"
+            self.phone.set('')
+            self.code.set('')
+            self.password.set('')
             self.start_button.configure(state="disabled")
-            self.auth_state.set("Вы вышли из аккаунта. Для нового поиска войдите снова.")
+            self.auth_state.set("Предыдущий вход завершён. Введите другой номер и нажмите «Получить код» или войдите по QR.")
             self.status.set("Для поиска войдите в Telegram")
             self.set_auth_busy(False)
+            self.update_actions()
+            self.tabs.select(self.login_tab)
+            self.login_canvas.yview_moveto(0)
+            self.phone_entry.focus_set()
         elif kind == "log":
             self.add_log(value)
         elif kind == "api_configured":

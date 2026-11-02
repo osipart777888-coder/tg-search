@@ -7,6 +7,26 @@ import install_local
 
 
 class InstallerTests(unittest.TestCase):
+    def test_only_first_install_may_import_a_source_session(self):
+        for existing in (False, True):
+            with self.subTest(existing_profile=existing), tempfile.TemporaryDirectory() as folder:
+                home = Path(folder)
+                (home / 'Desktop').mkdir()
+                source = home / 'source'; source.mkdir()
+                for name in ('app.py', 'search_telegram.py', 'find_top_legal.py', 'curate_top_legal.py', 'requirements.txt', 'README.md'):
+                    (source / name).write_text('# source')
+                for name in ('tgsearch', 'tests', '.local'):
+                    (source / name).mkdir()
+                (source / '.local/config.json').write_text('{"api_id":123}')
+                (source / '.local/telegram.session').write_bytes(b'old-source-session')
+                private = home / 'Library/Application Support/Telegram Contacts/.local'
+                if existing:
+                    private.mkdir(parents=True)
+                    (private / 'config.json').write_text('{"api_id":123}')
+                with patch.object(install_local, 'ROOT', source), patch('install_local.Path.home', return_value=home), patch('install_local.sys.platform', 'darwin'), patch('install_local.subprocess.run', return_value=NS(returncode=0)), patch('builtins.print'):
+                    install_local.install()
+                self.assertEqual((private / 'telegram.session').exists(), not existing)
+
     def test_macos_upgrade_preserves_user_data_and_creates_desktop_launcher(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
