@@ -207,10 +207,11 @@ class Application(tk.Tk):
         self.field_label(left, "Поисковые слова через запятую")
         self.keywords = self.text_input(left, 3)
         self.keywords.insert("1.0", PRESETS[self.topic.get()])
-        self.field_label(left, "Город / регион (необязательно)")
+        self.field_label(left, "Город / регионы (необязательно)")
         entry = ttk.Entry(left, textvariable=self.city)
         entry.pack(fill="x")
         self.filter_widgets.append(entry)
+        ttk.Label(left, text='Несколько — через запятую; подходит любой.\nПустое поле — без ограничения по городу.', style='Hint.TLabel', wraplength=305).pack(anchor='w', pady=(3, 0))
         self.field_label(left, "Кого искать")
         self.combo(left, self.roles, list(ROLE_FILTERS))
         grid = ttk.Frame(left)
@@ -453,6 +454,9 @@ class Application(tk.Tk):
             self.handle_event("stats", report["stats"])
             self.set_running(False)
             self.status.set(f"Открыта прошлая выгрузка. В общей истории: {self.history.total()} аккаунтов. Следующий поиск сохранит только новые.")
+            stats = report.get('stats', {})
+            if not report['contacts'] and stats.get('seen', 0) and stats.get('skipped', 0) == stats['seen']:
+                self.status.set(f"В прошлом поиске все {stats['seen']} сообществ отсеяны фильтрами. До проверки ников и администраторов поиск не дошёл. Проверьте регион и минимум участников.")
         except (OSError, ValueError, KeyError, TypeError):
             return
 
@@ -714,7 +718,7 @@ class Application(tk.Tk):
             if value.get('export_check'):
                 return
             if "new" in value:
-                self.stats.set(f"Новых: {value['new']} · Найдено: {value['contacts']} · Сообществ: {value['scanned']}")
+                self.stats.set(f"Новых: {value['new']} · Найдено: {value['contacts']} · Проверено: {value.get('seen', value['scanned'])} · Пропущено: {value.get('skipped', 0)}")
             else:
                 self.stats.set(f"В прошлой выгрузке: {value['contacts']} · Сообществ: {value['scanned']}")
         elif kind == 'contact_checked':
@@ -745,6 +749,8 @@ class Application(tk.Tk):
             self.set_running(False)
             prefix = "Остановлено" if value.cancelled else "Готово"
             self.status.set(value.reason or f"{prefix}. Новых: {len(value.new_contacts)}, уже были: {len(value.contacts) - len(value.new_contacts)}. В базе: {self.history.total()}. TXT содержит только новые.")
+            if not value.reason and not value.contacts and value.seen and len(value.seen) == value.skipped:
+                self.status.set(f'{prefix}. Все {value.skipped} сообществ отсеяны фильтрами до проверки контактов. Причины пропуска указаны в журнале.')
             if value.reason and value.options.limit_mode == "Остановить и показать уведомление":
                 messagebox.showinfo("Ограничение Telegram", value.reason, parent=self)
             if self.closing:

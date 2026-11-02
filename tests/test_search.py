@@ -66,6 +66,20 @@ class ExtractionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_queries("a")
 
+    def test_multiple_regions_are_alternatives_and_generate_separate_queries(self):
+        places='Свердловская область, Челябинская область'
+        self.assertTrue(city_matches(places,'Юристы: Челябинская область'))
+        self.assertTrue(city_matches(places,'Свердловская область — юридическая помощь'))
+        self.assertFalse(city_matches(places,'Юристы Москвы'))
+        self.assertTrue(city_matches('Казань; Москва\nСПб','Московские юристы'))
+        self.assertEqual(make_queries('юрист',places),['юрист Свердловская область','юрист Челябинская область','юрист'])
+        self.assertEqual(make_queries('юрист','Москва, москва; Казань'),['юрист Москва','юрист Казань','юрист'])
+        self.assertEqual(make_queries('юрист','Москва, Казань, москва'),['юрист Москва','юрист Казань','юрист'])
+        self.assertEqual(make_queries('юрист',' , ;\n'),['юрист'])
+        self.assertTrue(city_matches(' , ;\n','Любой город'))
+        with self.assertRaisesRegex(ValueError,'10'):
+            make_queries('юрист',','.join('Регион'+str(i) for i in range(11)))
+
     def test_txt_one_handle_per_line_sorted_without_duplicates(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "result.txt"
@@ -170,6 +184,20 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.scanned, 0)
         self.assertFalse(result.contacts)
         self.assertNotIn("admins", self.client.calls)
+
+    async def test_region_list_does_not_skip_a_matching_community_before_contact_collection(self):
+        self.client.about += '\nЧелябинская область'
+        result = await self.engine.run(self.options(city='свердловская область,челябинская область'))
+        self.assertGreater(len(result.contacts),0)
+        self.assertIn('admins',self.client.calls)
+        self.assertEqual(result.skipped,0)
+
+    async def test_filter_reasons_are_logged_and_no_contact_requests_are_made(self):
+        result = await self.engine.run(self.options(min_members=5000))
+        self.assertFalse(result.contacts)
+        self.assertTrue(any('минимум в настройках — 5000' in value for kind,value in self.events if kind=='log'))
+        self.assertNotIn('admins',self.client.calls)
+        self.assertFalse(any(call.startswith('resolve:') for call in self.client.calls))
 
     async def test_channel_type_filter(self):
         result = await self.engine.run(self.options(chat_type="Каналы"))

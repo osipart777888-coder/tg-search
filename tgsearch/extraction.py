@@ -62,16 +62,25 @@ def make_queries(keywords, city=""):
     terms = split_terms(keywords)
     if not terms or len(terms) > 20 or any(len(t) < 3 for t in terms):
         raise ValueError("Укажите от 1 до 20 запросов, минимум по 3 символа; разделяйте их запятыми.")
-    values = [f"{term} {city.strip()}" for term in terms] + terms if city.strip() else terms
+    places = {}
+    for value in re.split(r'[,;\n]+', city):
+        if value.strip():
+            places.setdefault(value.strip().casefold(), value.strip())
+    if len(places) > 10:
+        raise ValueError("Укажите не более 10 городов или регионов через запятую.")
+    # Keep the user's spelling in API queries; matching is case insensitive.
+    places = list(places.values())
+    values = [f"{term} {place}" for place in places for term in terms] + terms if places else terms
     return list(dict.fromkeys(values))
 
 
 def city_matches(city, text):
-    if not city.strip():
+    places = split_terms(city)
+    if not places:
         return True
     aliases = {"москва": ["моск", "moscow", "msk"], "спб": ["петербург", "спб", "spb"],
                "санкт-петербург": ["петербург", "спб", "spb"]}
-    return any(term in text.lower() for term in aliases.get(city.lower().strip(), [city.lower().strip()]))
+    return any(term in text.lower() for place in places for term in aliases.get(place, [place]))
 
 
 def _line_role(text, start, end):

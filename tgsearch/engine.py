@@ -383,6 +383,7 @@ class SearchEngine:
         if not isinstance(chat, types.Channel) or not chat.username or chat.id in self.processed:
             return
         if self.options.chat_type == 'Группы' and chat.broadcast or self.options.chat_type == 'Каналы' and not chat.broadcast:
+            self.log(f'Пропуск @{chat.username}: выбран тип «{self.options.chat_type}».')
             self.processed.add(chat.id)
             return
         self.seen.add(chat.id)
@@ -404,7 +405,14 @@ class SearchEngine:
         else:
             self.log('Описание из кеша; публикации и доступные администраторы проверяются заново.')
         about, count = metadata['about'], metadata['count']
-        if not city_matches(self.options.city, chat.title + ' ' + about) or self.options.min_members and (count is None or count < self.options.min_members):
+        if not city_matches(self.options.city, chat.title + ' ' + about):
+            self.log(f'Пропуск @{chat.username}: ни один город/регион из «{self.options.city}» не найден в названии или описании.')
+            self.skipped += 1
+            self.processed.add(chat.id)
+            self.save()
+            return
+        if self.options.min_members and (count is None or count < self.options.min_members):
+            self.log(f'Пропуск @{chat.username}: участников {count if count is not None else "неизвестно"}; минимум в настройках — {self.options.min_members}.')
             self.skipped += 1
             self.processed.add(chat.id)
             self.save()
