@@ -9,8 +9,7 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telethon import TelegramClient, errors, types
-from telethon.tl.functions.auth import LogOutRequest
+from telethon import TelegramClient, errors
 
 from .storage import PRIVATE, load_config, save_config, redact
 from .control import Cooldown, SearchPaused, session_lock
@@ -105,7 +104,6 @@ class Backend:
         self.engine = None
         self.qr_task = None
         self.resend_after = 0.0
-        self.active_phone = ""
 
     def emit(self, kind, data):
         self.events.put((kind, data))
@@ -162,10 +160,6 @@ class Backend:
         me = await asyncio.wait_for(self.client.get_me(), timeout=25)
         if me is None:
             raise ValueError("Вход не завершён. Запросите код ещё раз.")
-        self.active_phone = '+' + me.phone.lstrip('+') if getattr(me, 'phone', None) else ''
-        self.phone = self.active_phone
-        self.code_hash = None
-        self.code_is_text = False
         self.persist_session()
         return f"@{me.username}" if me.username else (me.first_name or "Аккаунт подключён")
 
@@ -177,21 +171,14 @@ class Backend:
             remaining = int(self.resend_after - time.monotonic()) + 1
             raise ValueError(f"Подождите ещё {remaining} сек. перед повторным запросом. Если код не приходит, используйте вход по QR.")
         Cooldown(PRIVATE).check()
-        client = await self.configure_client(api_id, api_hash)
+        client = await self.configure_client(api_id, api_hash, phone)
         if await client.is_user_authorized():
-            me = await asyncio.wait_for(client.get_me(), timeout=25)
-            current_phone = '+' + me.phone.lstrip('+') if getattr(me, 'phone', None) else ''
-            if current_phone != phone:
-                raise ValueError('Подключён другой аккаунт. Нажмите «Сменить аккаунт», затем введите новый номер.')
             return {"identity": await self.identity()}
         sent = await asyncio.wait_for(client.send_code_request(phone), timeout=40)
         self.phone = phone
         self.code_hash = sent.phone_code_hash
         self.resend_after = time.monotonic() + max(30, getattr(sent, "timeout", None) or 60)
         self.code_is_text = type(sent.type).__name__ in {"SentCodeTypeSmsWord", "SentCodeTypeSmsPhrase"}
-        config = load_config()
-        config['phone'] = phone
-        save_config(config)
         _write_diagnostic({"action": "code_delivery", "code_type": type(sent.type).__name__,
                            "next_type": type(getattr(sent, "next_type", None)).__name__,
                            "timeout": getattr(sent, "timeout", None)})
@@ -343,61 +330,6 @@ class Backend:
                                 'categories': limiter.counts, 'export_check': True})
             self.persist_session()
 
-    async def verify_communities(self, communities, cache_hours=24, maximum=300):
-        from .control import OperationLimiter
-        from .geography import russia_basis
-        from .history import timestamp
-        from telethon.tl.functions.channels import GetFullChannelRequest
-        self.export_task = asyncio.current_task()
-        limiter = None
-        try:
-            Cooldown(PRIVATE).check()
-            client = await self.connect()
-            limiter = OperationLimiter(PRIVATE, maximum=maximum)
-            verified = []
-            with session_lock(PRIVATE, 'search.lock'), limiter.bind(client):
-                for row in communities:
-                    try:
-                        fresh = bool(row.checked_at) and 0 <= time.time() - datetime.fromisoformat(row.checked_at).timestamp() < cache_hours * 3600
-                    except ValueError:
-                        fresh = False
-                    if fresh and row.verification == 'verified' and (not row.russia_only or row.russia_basis):
-                        verified.append(row)
-                        continue
-                    try:
-                        entity = await limiter.call(lambda: client.get_entity(types.PeerChannel(row.community_id)), 'discovery')
-                        if not isinstance(entity, types.Channel) or entity.id != row.community_id or not entity.username:
-                            row.verification = 'incomplete'
-                        else:
-                            row.username, row.title = entity.username.lower(), entity.title
-                            row.kind = 'Канал' if entity.broadcast else 'Группа'
-                            row.members = getattr(entity, 'participants_count', None)
-                            row.link, row.checked_at = f'https://t.me/{entity.username}', timestamp()
-                            row.verification = 'verified'
-                            if row.russia_only:
-                                full = await limiter.call(lambda: client(GetFullChannelRequest(entity)), 'descriptions')
-                                row.russia_basis = russia_basis(entity.title, getattr(full.full_chat, 'about', '') or '')
-                                if not row.russia_basis:
-                                    row.verification = 'incomplete'
-                            if row.verification == 'verified':
-                                verified.append(row)
-                    except SearchPaused:
-                        row.verification = 'incomplete'
-                        self.emit('community_checked', row)
-                        raise
-                    except (errors.RPCError, OSError, asyncio.TimeoutError, ValueError):
-                        row.verification = 'incomplete'
-                    self.emit('community_checked', row)
-            return verified
-        except asyncio.CancelledError:
-            return None
-        finally:
-            if limiter:
-                self.emit('stats', {'operations': limiter.total, 'api_errors': limiter.errors,
-                                    'categories': limiter.counts, 'export_check': True})
-            self.persist_session()
-            self.export_task = None
-
     def stop_search(self):
         def cancel():
             if self.search_task and not self.search_task.done():
@@ -443,42 +375,9 @@ class Backend:
         await self.disconnect()
 
     async def logout(self):
-        for name in ('search_task', 'export_task', 'qr_task'):
-            task = getattr(self, name, None)
-            if task is not None and not task.done():
-                raise ValueError('Сначала завершите текущее действие, затем смените аккаунт.')
-        Cooldown(PRIVATE).check()
-        config = load_config()
-        if self.client is None and (PRIVATE / 'telegram.session').exists():
-            await self.connect()
-        session = getattr(self.client, 'session', None)
-        try:
-            # get_me propagates FloodWait; is_user_authorized suppresses RPC
-            # errors and could misclassify a limited session as logged out.
-            if self.client and await asyncio.wait_for(self.client.get_me(), timeout=25) is not None:
-                # Telethon.log_out() swallows RPC errors, including FloodWait.
-                # Use its public request directly so a failed logout never looks
-                # successful and the persistent cooldown is preserved.
-                await asyncio.wait_for(self.client(LogOutRequest()), timeout=30)
-        except (errors.AuthKeyUnregisteredError, errors.SessionRevokedError, errors.AuthKeyDuplicatedError):
-            # Telegram has already invalidated this session; a user-requested
-            # account change can still remove its unusable local key.
-            pass
-        except errors.FloodWaitError as exc:
-            Cooldown(PRIVATE).impose(exc.seconds)
-            raise
-        await self.disconnect()
-        if session is not None:
-            session.delete()
-        self.phone = ''
-        self.active_phone = ''
+        if self.client:
+            Cooldown(PRIVATE).check()
+            await self.client.log_out()
+            await self.disconnect()
         self.code_hash = None
-        self.code_is_text = False
-        self.resend_after = 0.0
-        config.pop('phone', None)
-        try:
-            save_config(config)
-        except (OSError, ValueError) as exc:
-            record_error('logout_settings', exc)
-            self.emit('log', 'Вход завершён. Сохранённый номер не удалось очистить в настройках; введите новый номер во вкладке входа.')
         return None

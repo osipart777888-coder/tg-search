@@ -11,10 +11,8 @@ from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.contacts import SearchRequest
 
 from .control import LimitReached, OperationLimiter, SearchPaused, session_lock
-from .communities import Community, discovery_variants, export_communities_txt, title_matches
 from .extraction import ROLE_LABELS, city_matches, extract_candidates, make_queries, public_message_text
 from .history import ContactHistory, timestamp
-from .geography import russia_basis
 from .storage import PRIVATE, RESULTS, atomic_text, export_txt, prepare_storage, redact
 
 
@@ -37,26 +35,19 @@ class SearchOptions:
     force_refresh: bool = False
     limit_mode: str = "Остановить и сохранить"
     retention_days: int = 30
-    communities_only: bool = False
-    russia_only: bool = False
 
     def validate(self):
-        if (not self.communities_only and not self.roles) or not self.roles <= ROLE_LABELS.keys():
+        if not self.roles or not self.roles <= ROLE_LABELS.keys():
             raise ValueError("Выберите, кого искать.")
         if self.chat_type not in {"Все", "Группы", "Каналы"}:
             raise ValueError("Неизвестный тип сообщества.")
-        maximum_chats = 10000 if self.communities_only else 300
-        if not 1 <= self.max_chats <= maximum_chats:
-            raise ValueError(f'Лимит сообществ в этом режиме: от 1 до {maximum_chats}. Лимит API-операций задаётся отдельно.')
-        if not 0 <= self.posts <= 100 or self.min_members < 0:
-            raise ValueError("Публикации: 0–100; размер аудитории: от 0.")
+        if not 1 <= self.max_chats <= 300 or not 0 <= self.posts <= 100 or self.min_members < 0:
+            raise ValueError("Сообщества: 1–300; публикации: 0–100; размер аудитории: от 0.")
         if not 1 <= self.max_new <= 10000 or not 1 <= self.max_operations <= 10000 or not 0 <= self.cache_hours <= 8760:
             raise ValueError("Новые контакты и API-операции: 1–10000; кеш: 0–8760 часов.")
         if self.limit_mode not in {"Остановить и сохранить", "Остановить и показать уведомление"} or not 1 <= self.retention_days <= 3650:
             raise ValueError("Проверьте режим остановки и срок хранения: 1–3650 дней.")
         queries = make_queries(self.keywords, self.city) if self.keywords.strip() else []
-        if self.russia_only:
-            queries = list(dict.fromkeys([f'{q} Россия' for q in queries] + queries))
         sources = []
         for term in self.sources.replace("\n", ",").replace(";", ",").split(","):
             term = term.strip().removeprefix("https://").removeprefix("http://")
@@ -152,21 +143,15 @@ def recover_latest_report(history):
         return
     contacts = [contact_from_dict(row) for row in snapshot['contacts']]
     new = [c for c in contacts if c.is_new and c.verification == 'verified']
-    communities = [Community(**row) for row in snapshot.get('communities', [])]
-    communities_only = snapshot['options'].get('communities_only', False)
-    if communities_only:
-        export_communities_txt(output, communities)
-    else:
-        export_txt(output, new)
+    export_txt(output, new)
     counters = snapshot.get('counters', {})
     counts = counters.get('counts', {})
     stats = {'contacts': len(contacts), 'new': len(new), 'known': len(contacts)-len(new),
              'scanned': len(snapshot.get('scanned_ids', [])), 'history_total': history.total(),
-             'operations': sum(counts.values()), 'categories': counts, 'api_errors': counters.get('errors', 0),
-             'communities_only': communities_only, 'communities': len(communities), 'seen': len(snapshot.get('seen', []))}
+             'operations': sum(counts.values()), 'categories': counts, 'api_errors': counters.get('errors', 0)}
     data = {'file': str(output), 'options': snapshot['options'], 'contacts': snapshot['contacts'],
             'stats': stats, 'complete': snapshot['complete'], 'pending': list(snapshot.get('pending', {}).values()),
-            'reason': 'Восстановлено из контрольной точки SQLite.', 'communities': snapshot.get('communities', [])}
+            'reason': 'Восстановлено из контрольной точки SQLite.'}
     atomic_text(report, json.dumps(data, ensure_ascii=False, indent=2))
     atomic_text(PRIVATE / 'last_search.json', json.dumps({'report': str(report)}, ensure_ascii=False))
 
@@ -175,8 +160,6 @@ class SearchEngine:
     def __init__(self, client, emit, request_delay=2.0):
         self.client, self.emit, self.request_delay = client, emit, request_delay
         self.contacts, self.resolved, self.full_cache, self.source_entities = {}, {}, {}, {}
-        self.communities = {}
-        self.discovery_queries = []
         self.seen, self.processed, self.stages, self.queries_done, self.sources_done = set(), set(), set(), set(), set()
         self.queue, self.pending = {}, {}
         self.scanned = self.skipped = self.warnings = 0
@@ -222,8 +205,6 @@ class SearchEngine:
         return {'run_id': self.path.stem, 'file': str(self.path),
                 'options': {**asdict(self.options), 'roles': sorted(self.options.roles)},
                 'contacts': [asdict(c) for c in self.contacts.values()],
-                'communities': [asdict(c) for c in self.communities.values()],
-                'discovery_queries': self.discovery_queries,
                 'seen': sorted(self.seen), 'processed': sorted(self.processed), 'stages': sorted(self.stages),
                 'queries_done': sorted(self.queries_done), 'sources_done': sorted(self.sources_done),
                 'queue': list(self.queue.values()), 'pending': self.pending,
@@ -236,8 +217,6 @@ class SearchEngine:
             raise ValueError('Путь незавершённого поиска вне папки результатов.')
         self.path = path
         self.contacts = {r['user_id']: contact_from_dict(r) for r in data['contacts']}
-        self.communities = {r['community_id']: Community(**r) for r in data.get('communities', [])}
-        self.discovery_queries = list(data.get('discovery_queries', []))
         for name in ('seen', 'processed', 'stages', 'queries_done', 'sources_done', 'scanned_ids'):
             setattr(self, name, set(data.get(name, [])))
         self.queue = {r['id']: r for r in data.get('queue', [])}
@@ -249,8 +228,6 @@ class SearchEngine:
         self.limiter.errors = counters.get('errors', 0)
         for contact in self.contacts.values():
             self.emit('contact', contact)
-        for community in self.communities.values():
-            self.emit('community', community)
         for item in self.pending.values():
             self.emit('pending', item)
 
@@ -275,16 +252,9 @@ class SearchEngine:
                 self.restore(resume)
             else:
                 stamp = datetime.now(ZoneInfo('Europe/Moscow')).strftime('%Y-%m-%d_%H-%M-%S_%f')
-                prefix = 'Сообщества' if options.communities_only else 'Новые_ники'
-                self.path = RESULTS / f'{prefix}_{stamp}.txt'
+                self.path = RESULTS / f'Новые_ники_{stamp}.txt'
             queries, sources = options.validate()
-            if options.communities_only:
-                self.discovery_queries = self.discovery_queries or queries.copy()
-                queries = self.discovery_queries
-            self.log('Поиск каналов и групп по названию. В TXT попадут названия, ники и ссылки.' if options.communities_only else
-                     'Поиск публичных контактов. История общая для всех тем; TXT содержит новые аккаунты.')
-            if options.russia_only:
-                self.log('Только РФ: проверяю название и описание. Без явного признака РФ или при смешанной географии — пропуск. Это не определение местонахождения людей.')
+            self.log('Поиск публичных контактов. История общая для всех тем; TXT содержит новые аккаунты.')
             self.save()
             try:
                 await self.process_queue()
@@ -313,14 +283,6 @@ class SearchEngine:
                     except (errors.RPCError, OSError, asyncio.TimeoutError) as exc:
                         self.warn(f'Запрос «{keyword}»', exc)
                         continue
-                    if options.communities_only:
-                        public = [chat for chat in result.chats if isinstance(chat, types.Channel) and chat.username]
-                        matching = [chat for chat in public if title_matches(options.keywords, chat.title)
-                                    and city_matches(options.city, chat.title)]
-                        self.log(f'Telegram вернул публичных сообществ: {len(public)}; совпадений в названии: {len(matching)}.')
-                        if not matching:
-                            variants = [q for q in discovery_variants(keyword) if q not in queries]
-                            queries.extend(variants[:max(0, 100 - len(queries))])
                     for chat in result.chats:
                         self.enqueue(chat)
                     self.queries_done.add(keyword)
@@ -342,20 +304,14 @@ class SearchEngine:
             finally:
                 self.save()
                 self.emit('stats', self.stats())
-        if options.communities_only:
-            self.log(f'Сохранено сообществ: {len(self.communities)}. {self.path.name}')
-            if not self.communities:
-                self.log('Подходящих сообществ в выдаче Telegram нет. Попробуйте полное название или публичные ссылки в списке сообществ. Для поиска без привязки к городу оставьте поле города пустым.')
-        else:
-            self.log(f'Сохранено: найдено {len(self.contacts)}, новых {len(self.new_contacts)}. {self.path.name}')
+        self.log(f'Сохранено: найдено {len(self.contacts)}, новых {len(self.new_contacts)}. {self.path.name}')
         return self
 
     def enqueue(self, chat):
         if isinstance(chat, types.Channel) and chat.username:
             self.queue[chat.id] = {'id': chat.id, 'username': chat.username, 'title': chat.title,
                                    'access_hash': getattr(chat, 'access_hash', 0) or 0,
-                                   'broadcast': bool(chat.broadcast), 'megagroup': bool(chat.megagroup),
-                                   'participants_count': getattr(chat, 'participants_count', None)}
+                                   'broadcast': bool(chat.broadcast), 'megagroup': bool(chat.megagroup)}
 
     async def process_queue(self):
         for row in list(self.queue.values()):
@@ -365,8 +321,7 @@ class SearchEngine:
                 break
             chat = types.Channel(id=row['id'], title=row['title'], username=row['username'],
                                  access_hash=row['access_hash'], broadcast=row['broadcast'],
-                                 megagroup=row['megagroup'], photo=types.ChatPhotoEmpty(), date=None,
-                                 participants_count=row.get('participants_count'))
+                                 megagroup=row['megagroup'], photo=types.ChatPhotoEmpty(), date=None)
             self.attempted.add(chat.id)
             await self.visit(chat)
 
@@ -378,9 +333,7 @@ class SearchEngine:
                 'scanned': self.scanned, 'seen': len(self.seen), 'skipped': self.skipped,
                 'warnings': self.warnings, 'operations': limiter.total if limiter else 0,
                 'categories': dict(limiter.counts) if limiter else {}, 'api_errors': limiter.errors if limiter else 0,
-                'cooldown_until': limiter.cooldown.deadline() if limiter else 0, 'pending': len(self.pending),
-                'communities_only': getattr(getattr(self, 'options', None), 'communities_only', False),
-                'communities': len(self.communities)}
+                'cooldown_until': limiter.cooldown.deadline() if limiter else 0, 'pending': len(self.pending)}
 
     def save(self):
         if self.path is None:
@@ -393,15 +346,12 @@ class SearchEngine:
         self.dirty.clear()
         self.alias_updates.clear()
         self.last_save = time.monotonic()
-        if self.options.communities_only:
-            export_communities_txt(self.path, self.communities.values())
-        else:
-            export_txt(self.path, self.new_contacts.values())
+        export_txt(self.path, self.new_contacts.values())
         data = {'created_timezone': 'Europe/Moscow', 'file': str(self.path),
                 'options': {**asdict(self.options), 'roles': sorted(self.options.roles)},
                 'stats': self.stats(), 'cancelled': self.cancelled, 'reason': self.reason,
                 'complete': self.complete, 'contacts': [asdict(c) for c in self.contacts.values()],
-                'pending': list(self.pending.values()), 'communities': [asdict(c) for c in self.communities.values()]}
+                'pending': list(self.pending.values())}
         reports = PRIVATE / 'reports'
         reports.mkdir(mode=0o700, exist_ok=True)
         report_path = reports / (self.path.stem + '.json')
@@ -430,8 +380,6 @@ class SearchEngine:
         return True
 
     async def visit(self, chat):
-        if self.options.communities_only:
-            return await self.visit_community(chat)
         if not isinstance(chat, types.Channel) or not chat.username or chat.id in self.processed:
             return
         if self.options.chat_type == 'Группы' and chat.broadcast or self.options.chat_type == 'Каналы' and not chat.broadcast:
@@ -456,17 +404,7 @@ class SearchEngine:
         else:
             self.log('Описание из кеша; публикации и доступные администраторы проверяются заново.')
         about, count = metadata['about'], metadata['count']
-        if self.options.russia_only and not russia_basis(chat.title, about):
-            self.log(f'Пропуск @{chat.username}: нет однозначного публичного признака РФ.')
-            self.skipped += 1
-            self.processed.add(chat.id)
-            self.save()
-            return
         if not city_matches(self.options.city, chat.title + ' ' + about) or self.options.min_members and (count is None or count < self.options.min_members):
-            if not city_matches(self.options.city, chat.title + ' ' + about):
-                self.log(f'Пропуск @{chat.username}: город/регион «{self.options.city}» не найден в названии и описании.')
-            else:
-                self.log(f'Пропуск @{chat.username}: участников {count if count is not None else "неизвестно"}, требуется не менее {self.options.min_members}.')
             self.skipped += 1
             self.processed.add(chat.id)
             self.save()
@@ -499,63 +437,6 @@ class SearchEngine:
             success = await self.stage(chat, 'admins', admins) and success
         if success:
             self.processed.add(chat.id)
-        self.save()
-        self.emit('stats', self.stats())
-
-    async def visit_community(self, chat):
-        if not isinstance(chat, types.Channel) or not chat.username or chat.id in self.processed:
-            return
-        if self.options.chat_type == 'Группы' and chat.broadcast or self.options.chat_type == 'Каналы' and not chat.broadcast:
-            self.log(f'Пропуск @{chat.username}: выбран другой тип сообщества ({self.options.chat_type}).')
-            self.processed.add(chat.id)
-            return
-        # Telegram may match a username. Only literal title matches qualify here.
-        if not title_matches(self.options.keywords, chat.title) or not city_matches(self.options.city, chat.title):
-            if not title_matches(self.options.keywords, chat.title):
-                self.log(f'Пропуск @{chat.username}: ключевые слова не совпали с названием «{chat.title}».')
-            else:
-                self.log(f'Пропуск @{chat.username}: город/регион «{self.options.city}» не найден в названии «{chat.title}».')
-            self.processed.add(chat.id)
-            return
-        self.seen.add(chat.id)
-        self.log(f'Проверка названия: {chat.title} (@{chat.username})')
-        self.save()
-        count = getattr(chat, 'participants_count', None)
-        about = ''
-        if self.options.russia_only or self.options.min_members and count is None:
-            metadata = None if self.options.force_refresh else self.history.cached_community(chat.id, self.options.cache_hours)
-            if metadata is None:
-                try:
-                    full = await self.call(lambda: self.client(GetFullChannelRequest(chat)), 'descriptions')
-                except (errors.RPCError, OSError, asyncio.TimeoutError) as exc:
-                    self.warn('Описание и размер аудитории', exc)
-                    return
-                fc = full.full_chat
-                metadata = {'about': getattr(fc, 'about', '') or '', 'count': getattr(fc, 'participants_count', None),
-                            'pinned_id': getattr(fc, 'pinned_msg_id', None), 'title': chat.title, 'username': chat.username}
-                self.history.cache_community(chat.id, chat.username, metadata)
-            about = metadata['about']
-            if metadata['count'] is not None:
-                count = metadata['count']
-        basis = russia_basis(chat.title, about) if self.options.russia_only else ''
-        if self.options.russia_only and not basis:
-            self.log(f'Пропуск @{chat.username}: нет однозначного публичного признака РФ.')
-            self.skipped += 1
-            self.processed.add(chat.id)
-            self.save()
-            return
-        if self.options.min_members and (count is None or count < self.options.min_members):
-            self.log(f'Пропуск @{chat.username}: участников {count if count is not None else "неизвестно"}, требуется не менее {self.options.min_members}.')
-            self.skipped += 1
-        else:
-            self.scanned_ids.add(chat.id)
-            self.scanned = len(self.scanned_ids)
-            row = Community(chat.id, chat.username.lower(), chat.title, 'Канал' if chat.broadcast else 'Группа',
-                            f'https://t.me/{chat.username}', timestamp(), count,
-                            russia_only=self.options.russia_only, russia_basis=basis)
-            self.communities[chat.id] = row
-            self.emit('community', row)
-        self.processed.add(chat.id)
         self.save()
         self.emit('stats', self.stats())
 

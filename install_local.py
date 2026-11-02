@@ -33,12 +33,7 @@ def install_locked(target):
             shutil.copytree(ROOT / name, target / name, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
         private = target / ".local"
         private.mkdir(mode=0o700, exist_ok=True)
-        existing_profile = any((private / name).exists() for name in ('config.json', 'contacts.sqlite3', 'search_settings.json'))
         for name in ("config.json", "telegram.session"):
-            # A missing session in an existing profile means the user logged out.
-            # Never resurrect an old source-checkout login during an update.
-            if name == 'telegram.session' and existing_profile:
-                continue
             source = ROOT / ".local" / name
             destination = private / name
             if source.exists() and not destination.exists():
