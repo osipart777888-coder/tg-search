@@ -15,6 +15,7 @@ from tgsearch.extraction import PRESETS, ROLE_FILTERS
 from tgsearch.history import ContactHistory
 from tgsearch.storage import PRIVATE, RESULTS, atomic_text, export_csv, export_txt, load_config, prepare_storage
 from tgsearch.control import Cooldown, session_lock
+from tgsearch.communities import COMMUNITY_SEARCH_LABEL, Community, export_communities_txt, export_communities_csv
 from tgsearch.maintenance import clear_history, obsolete_reports, remove_reports, encrypt_backup
 
 BG = "#f2f5f8"
@@ -55,6 +56,8 @@ class Application(tk.Tk):
         self.closing = False
         self.auth_stage = "phone"
         self.contacts = {}
+        self.communities = {}
+        self.result_mode = 'contacts'
         self.last_path = None
         self.close_started = False
         self.qr_window = None
@@ -202,6 +205,7 @@ class Application(tk.Tk):
         self.status = tk.StringVar(value="Для поиска войдите в Telegram")
         self.stats = tk.StringVar(value=f"Новых: 0 · Найдено: 0 · В базе: {self.history.total()}")
         self.filter_widgets = []
+        self.contact_only_widgets = []
         ttk.Label(left, text="Настройки поиска и ограничения", font=("Helvetica Neue", 14, "bold")).pack(anchor="w", pady=(0, 10))
         self.field_label(left, "Тема")
         combo = self.combo(left, self.topic, list(PRESETS))
@@ -214,7 +218,10 @@ class Application(tk.Tk):
         entry.pack(fill="x")
         self.filter_widgets.append(entry)
         self.field_label(left, "Кого искать")
-        self.combo(left, self.roles, list(ROLE_FILTERS))
+        self.roles_combo = self.combo(left, self.roles, [*ROLE_FILTERS, COMMUNITY_SEARCH_LABEL])
+        self.roles_combo.bind('<<ComboboxSelected>>', self.update_search_mode)
+        self.mode_hint = tk.StringVar()
+        ttk.Label(left, textvariable=self.mode_hint, wraplength=305, style='Hint.TLabel').pack(anchor='w', pady=(5, 0))
         grid = ttk.Frame(left)
         grid.pack(fill="x", pady=(8, 0))
         grid.columnconfigure(0, weight=1)
@@ -224,11 +231,13 @@ class Application(tk.Tk):
         types_combo = ttk.Combobox(grid, textvariable=self.chat_type, values=["Все", "Группы", "Каналы"], state="readonly", width=12)
         types_combo.grid(row=1, column=0, sticky="ew", pady=3)
         limit = ttk.Spinbox(grid, from_=1, to=300, textvariable=self.max_chats, width=10)
+        self.chat_limit_input = limit
         limit.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=3)
         ttk.Label(grid, text="Постов на канал").grid(row=2, column=0, sticky="w", pady=(7, 0))
         ttk.Label(grid, text="Мин. участников").grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(7, 0))
         posts = ttk.Spinbox(grid, from_=0, to=100, textvariable=self.posts, width=10)
         posts.grid(row=3, column=0, sticky="ew", pady=3)
+        self.contact_only_widgets.append(posts)
         members = ttk.Spinbox(grid, from_=0, to=10000000, textvariable=self.min_members, width=10)
         members.grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=3)
         self.filter_widgets.extend([types_combo, limit, posts, members])
@@ -236,6 +245,7 @@ class Application(tk.Tk):
             widget = ttk.Checkbutton(left, text=label, variable=variable)
             widget.pack(anchor="w", pady=(7, 0))
             self.filter_widgets.append(widget)
+            self.contact_only_widgets.append(widget)
         for label, variable, high in [("Максимум новых контактов", self.max_new, 10000),
                                       ("Максимум API-операций", self.max_operations, 10000),
                                       ("Кеш описаний, часов (0 — обновлять)", self.cache_hours, 8760)]:
@@ -243,6 +253,8 @@ class Application(tk.Tk):
             widget = ttk.Spinbox(left, from_=0 if variable is self.cache_hours else 1, to=high, textvariable=variable)
             widget.pack(fill="x")
             self.filter_widgets.append(widget)
+            if variable is self.max_new:
+                self.contact_only_widgets.append(widget)
         self.field_label(left, "При ограничении Telegram")
         self.combo(left, self.limit_mode, ["Остановить и сохранить", "Остановить и показать уведомление"])
         force = ttk.Checkbutton(left, text="Принудительно обновить описания", variable=self.force_refresh)
@@ -291,12 +303,13 @@ class Application(tk.Tk):
         table_menu.add_command(label="Копировать ники", command=self.copy_nicks)
         table_menu.add_command(label="Копировать ссылки на источники", command=self.copy_sources)
         table_menu.add_separator()
-        table_menu.add_command(label="Выделить все контакты", command=self.select_all_contacts)
+        table_menu.add_command(label="Выделить всё", command=self.select_all_contacts)
         self.bind_context_menu(self.table, table_menu, table=True)
         evidence_header = ttk.Frame(right)
         evidence_header.grid(row=3, column=0, sticky="ew", pady=(10, 4))
         evidence_header.columnconfigure(0, weight=1)
-        ttk.Label(evidence_header, text="Источники выбранного контакта", style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+        self.evidence_heading = ttk.Label(evidence_header, text="Источники выбранного контакта", style="Hint.TLabel")
+        self.evidence_heading.grid(row=0, column=0, sticky="w")
         ttk.Button(evidence_header, text="Копировать ник", command=self.copy_nicks).grid(row=0, column=1, padx=(6, 0))
         ttk.Button(evidence_header, text="Копировать ссылки", command=self.copy_sources).grid(row=0, column=2, padx=(6, 0))
         self.evidence = self.output_text(right, 4)
@@ -308,10 +321,12 @@ class Application(tk.Tk):
         export_filters = ttk.Frame(right)
         export_filters.grid(row=7, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(export_filters, text="Экспорт:").pack(side="left")
-        ttk.Combobox(export_filters, textvariable=self.export_role, state="readonly", width=25,
-                     values=["Все типы", "Подтверждённый создатель", "Администратор", "Предполагаемый владелец", "Другой контакт"]).pack(side="left", padx=5)
-        ttk.Combobox(export_filters, textvariable=self.export_confidence, state="readonly", width=24,
-                     values=["Любая достоверность", "Подтверждено API", "Упоминания в тексте"]).pack(side="left")
+        self.export_role_combo = ttk.Combobox(export_filters, textvariable=self.export_role, state="readonly", width=25,
+                     values=["Все типы", "Подтверждённый создатель", "Администратор", "Предполагаемый владелец", "Другой контакт"])
+        self.export_role_combo.pack(side="left", padx=5)
+        self.export_confidence_combo = ttk.Combobox(export_filters, textvariable=self.export_confidence, state="readonly", width=24,
+                     values=["Любая достоверность", "Подтверждено API", "Упоминания в тексте"])
+        self.export_confidence_combo.pack(side="left")
         buttons = ttk.Frame(right)
         buttons.grid(row=8, column=0, sticky="ew", pady=(10, 0))
         self.open_button = ttk.Button(buttons, text="Открыть TXT", command=self.open_result, state="disabled")
@@ -325,6 +340,25 @@ class Application(tk.Tk):
         ttk.Button(buttons, text="Папка", command=lambda: open_path(RESULTS), width=6).pack(side="left", padx=(6, 0))
         self.add_log(f"В истории {self.history.total()} аккаунтов. TXT и CSV нового поиска содержат только новые контакты.")
         self.restore_search_settings()
+        self.update_search_mode()
+
+    def update_search_mode(self, _event=None):
+        communities_only = self.roles.get() == COMMUNITY_SEARCH_LABEL
+        self.chat_limit_input.configure(to=10000 if communities_only else 300)
+        self.mode_hint.set('Слова и город проверяются только в названии. Результат: название, @ник и ссылка. Лимит новых контактов не применяется.' if communities_only else '')
+        for widget in self.contact_only_widgets:
+            widget.configure(state='disabled' if self.running or communities_only else 'normal')
+
+    def configure_result_mode(self, communities_only):
+        self.result_mode = 'communities' if communities_only else 'contacts'
+        headings = ('Ник сообщества', 'Статус', 'Тип', 'Название канала / группы') if communities_only else ('Ник', 'Статус', 'Тип / достоверность', 'Группа / канал')
+        for column, label in zip(('username', 'state', 'role', 'source'), headings):
+            self.table.heading(column, text=label)
+        for widget in (self.export_role_combo, self.export_confidence_combo):
+            widget.configure(state='disabled' if communities_only else 'readonly')
+        self.csv_button.configure(text='Сообщества CSV' if communities_only else 'Источники CSV')
+        self.history_button.configure(text='База контактов TXT' if communities_only else 'Вся база TXT')
+        self.evidence_heading.configure(text='Выбранный канал / группа' if communities_only else 'Источники выбранного контакта')
 
     def apply_api(self):
         if self.running or self.auth_busy:
@@ -412,6 +446,7 @@ class Application(tk.Tk):
             clear_history(PRIVATE, confirmed=True)
             self.history = ContactHistory()
             self.contacts.clear()
+            self.communities.clear()
             self.table.delete(*self.table.get_children())
             self.last_path = None
             self.restored_results = True
@@ -461,15 +496,20 @@ class Application(tk.Tk):
             if not report_path.is_relative_to((PRIVATE / "reports").resolve()):
                 return
             report = json.loads(report_path.read_text(encoding="utf-8"))
+            communities_only = report.get('options', {}).get('communities_only', False)
+            self.configure_result_mode(communities_only)
             for row in report["contacts"]:
                 contact = contact_from_dict(row)
                 self.handle_event("contact", contact)
             for item in report.get('pending', []):
                 self.handle_event('pending', item)
+            for row in report.get('communities', []):
+                self.handle_event('community', Community(**row))
             self.last_path = Path(report["file"])
             self.handle_event("stats", report["stats"])
             self.set_running(False)
-            self.status.set(f"Открыта прошлая выгрузка. В общей истории: {self.history.total()} аккаунтов. Следующий поиск сохранит только новые.")
+            self.status.set('Открыта прошлая выгрузка каналов и групп. TXT содержит названия, ники и ссылки.' if communities_only else
+                            f"Открыта прошлая выгрузка. В общей истории: {self.history.total()} аккаунтов. Следующий поиск сохранит только новые.")
         except (OSError, ValueError, KeyError, TypeError):
             return
 
@@ -540,18 +580,27 @@ class Application(tk.Tk):
     def selected_contacts(self):
         selected = set(self.table.selection())
         return [self.contacts[int(row)] for row in self.table.get_children()
-                if row in selected and not row.startswith('pending:') and int(row) in self.contacts]
+                if row in selected and row.isdigit() and int(row) in self.contacts]
+
+    def selected_communities(self):
+        selected = set(self.table.selection())
+        return [self.communities[int(row.split(':', 1)[1])] for row in self.table.get_children()
+                if row in selected and row.startswith('community:') and int(row.split(':', 1)[1]) in self.communities]
 
     def copy_nicks(self, _event=None):
-        names = list(dict.fromkeys('@' + c.username for c in self.selected_contacts()))
+        rows = self.selected_communities() if self.result_mode == 'communities' else self.selected_contacts()
+        names = list(dict.fromkeys('@' + c.username for c in rows))
         if not names:
-            self.add_log("Сначала выберите контакт в таблице.")
+            self.add_log("Сначала выберите строку в таблице.")
         return self.copy_to_clipboard("\n".join(names), f"Ники скопированы в буфер обмена: {len(names)}.")
 
     def copy_sources(self, _event=None):
-        links = list(dict.fromkeys(e.source for c in self.selected_contacts() for e in c.evidence if e.source))
+        if self.result_mode == 'communities':
+            links = list(dict.fromkeys(c.link for c in self.selected_communities()))
+        else:
+            links = list(dict.fromkeys(e.source for c in self.selected_contacts() for e in c.evidence if e.source))
         if not links:
-            self.add_log("Выберите контакт с источниками в таблице.")
+            self.add_log("Выберите строку со ссылками в таблице.")
         return self.copy_to_clipboard("\n".join(links), "Ссылки на источники скопированы в буфер обмена.")
 
     def copy_text(self, widget, whole=False):
@@ -698,27 +747,33 @@ class Application(tk.Tk):
             return
         try:
             Cooldown(PRIVATE).check()
-            options = SearchOptions(self.keywords.get("1.0", "end").strip(), ROLE_FILTERS[self.roles.get()],
+            communities_only = self.roles.get() == COMMUNITY_SEARCH_LABEL
+            options = SearchOptions(self.keywords.get("1.0", "end").strip(), ROLE_FILTERS.get(self.roles.get(), set()),
                                     self.city.get().strip(), self.chat_type.get(), int(self.max_chats.get()),
-                                    int(self.posts.get()), int(self.min_members.get()), self.admins.get(),
-                                    self.bots.get(), self.sources.get("1.0", "end").strip(),
-                                    max_new=int(self.max_new.get()), max_operations=int(self.max_operations.get()),
+                                    0 if communities_only else int(self.posts.get()), int(self.min_members.get()), self.admins.get() and not communities_only,
+                                    self.bots.get() and not communities_only, self.sources.get("1.0", "end").strip(),
+                                    max_new=100 if communities_only else int(self.max_new.get()), max_operations=int(self.max_operations.get()),
                                     cache_hours=float(self.cache_hours.get()), force_refresh=self.force_refresh.get(),
-                                    retention_days=int(self.retention_days.get()), limit_mode=self.limit_mode.get())
+                                    retention_days=int(self.retention_days.get()), limit_mode=self.limit_mode.get(),
+                                    communities_only=communities_only)
             options.validate()
         except Exception as exc:
+            self.status.set(f'Поиск не запущен: {exc}')
+            self.add_log(f'Поиск не запущен: {exc}')
             messagebox.showerror("Настройки поиска", str(exc), parent=self)
             return
-        settings = {field: getattr(self, field).get() for field in ("topic", "city", "roles", "chat_type", "max_chats", "posts", "min_members", "max_new", "max_operations", "cache_hours", "retention_days", "limit_mode")}
-        settings.update(keywords=options.keywords, sources=options.sources, check_admins=options.check_admins, include_bots=options.include_bots)
-        atomic_text(PRIVATE / 'search_settings.json', json.dumps(settings, ensure_ascii=False, indent=2))
+        self.persist_search_settings()
         self.contacts.clear()
+        self.communities.clear()
+        checkpoint = self.history.unfinished() if resume else None
+        self.configure_result_mode(checkpoint['options'].get('communities_only', False) if checkpoint else options.communities_only)
         self.last_path = None
         self.table.delete(*self.table.get_children())
         self.evidence.configure(state="normal")
         self.evidence.delete("1.0", "end")
         self.evidence.configure(state="disabled")
-        self.stats.set(f"Новых: 0 · Найдено: 0 · В базе: {self.history.total()}")
+        self.stats.set('Найдено сообществ: 0 · Проверено: 0' if self.result_mode == 'communities' else
+                       f"Новых: 0 · Найдено: 0 · В базе: {self.history.total()}")
         self.set_running(True)
         self.backend.submit(self.backend.search(options, resume=resume), "finished")
 
@@ -733,9 +788,11 @@ class Application(tk.Tk):
         self.history_button.configure(state="disabled" if running else "normal")
         self.set_auth_busy(self.auth_busy)
         self.update_actions()
+        self.update_search_mode()
         if running:
             self.progress.start(12)
-            self.status.set("Идёт поиск. В TXT сохраняются только новые аккаунты; история общая для всех тем.")
+            self.status.set('Идёт поиск по названиям. В TXT сохраняются каналы и группы.' if self.result_mode == 'communities' else
+                            "Идёт поиск. В TXT сохраняются только новые аккаунты; история общая для всех тем.")
         else:
             self.progress.stop()
 
@@ -811,8 +868,9 @@ class Application(tk.Tk):
             if request and value is not None:
                 path, kind_export = request
                 try:
-                    (export_csv if kind_export == 'csv' else export_txt)(path, value)
-                    self.add_log(f"Экспортировано: {len(value)} контактов. {path}")
+                    writers = {'csv': export_csv, 'txt': export_txt, 'community_csv': export_communities_csv, 'community_txt': export_communities_txt}
+                    writers[kind_export](path, value)
+                    self.add_log(f"Экспортировано записей: {len(value)}. {path}")
                 except OSError:
                     messagebox.showerror('Экспорт', 'Не удалось записать файл. Выберите другую папку.', parent=self)
             self.set_running(False)
@@ -832,7 +890,9 @@ class Application(tk.Tk):
                 self.api_stats.set(f"API-операций: {value['operations']} · Ошибок API: {value.get('api_errors', 0)}\n{counts}")
             if value.get('export_check'):
                 return
-            if "new" in value:
+            if value.get('communities_only'):
+                self.stats.set(f"Найдено сообществ: {value['communities']} · Проверено: {value['seen']}")
+            elif "new" in value:
                 self.stats.set(f"Новых: {value['new']} · Найдено: {value['contacts']} · Сообществ: {value['scanned']}")
             else:
                 self.stats.set(f"В прошлой выгрузке: {value['contacts']} · Сообществ: {value['scanned']}")
@@ -841,6 +901,14 @@ class Application(tk.Tk):
             if current:
                 from dataclasses import replace
                 self.handle_event('contact', replace(current, username=value.username, checked_at=value.checked_at, verification=value.verification))
+        elif kind in {'community', 'community_checked'}:
+            self.communities[value.community_id] = value
+            iid = f'community:{value.community_id}'
+            values = ('@' + value.username, value.status, value.kind, value.title)
+            if self.table.exists(iid):
+                self.table.item(iid, values=values)
+            else:
+                self.table.insert('', 'end', iid=iid, values=values)
         elif kind == "contact":
             self.contacts[value.user_id] = value
             if self.table.exists('pending:' + value.username):
@@ -863,7 +931,8 @@ class Application(tk.Tk):
             self.last_path = value.path
             self.set_running(False)
             prefix = "Остановлено" if value.cancelled else "Готово"
-            self.status.set(value.reason or f"{prefix}. Новых: {len(value.new_contacts)}, уже были: {len(value.contacts) - len(value.new_contacts)}. В базе: {self.history.total()}. TXT содержит только новые.")
+            self.status.set(value.reason or (f'{prefix}. Найдено сообществ: {len(value.communities)}. TXT содержит названия, ники и ссылки.' if value.options.communities_only else
+                            f"{prefix}. Новых: {len(value.new_contacts)}, уже были: {len(value.contacts) - len(value.new_contacts)}. В базе: {self.history.total()}. TXT содержит только новые."))
             if value.reason and value.options.limit_mode == "Остановить и показать уведомление":
                 messagebox.showinfo("Ограничение Telegram", value.reason, parent=self)
             if self.closing:
@@ -899,6 +968,14 @@ class Application(tk.Tk):
         selection = self.table.selection()
         if not selection:
             return
+        if selection[0].startswith('community:'):
+            row = self.communities[int(selection[0].split(':', 1)[1])]
+            text = f'{row.title}\n{row.kind} · @{row.username}\n{row.link}\nУчастников: {row.members if row.members is not None else "не запрашивалось"}\nПроверено: {row.checked_at}\n{row.status}'
+            self.evidence.configure(state='normal')
+            self.evidence.delete('1.0', 'end')
+            self.evidence.insert('1.0', text)
+            self.evidence.configure(state='disabled')
+            return
         if selection[0].startswith('pending:'):
             return
         contact = self.contacts[int(selection[0])]
@@ -910,7 +987,9 @@ class Application(tk.Tk):
 
     def open_contact(self, _event=None):
         selection = self.table.selection()
-        if selection and not selection[0].startswith("pending:"):
+        if selection and selection[0].startswith('community:'):
+            open_path(self.communities[int(selection[0].split(':', 1)[1])].link)
+        elif selection and not selection[0].startswith("pending:"):
             open_path(f"https://t.me/{self.contacts[int(selection[0])].username}")
 
     def open_result(self):
@@ -931,12 +1010,13 @@ class Application(tk.Tk):
     def request_export(self, kind='txt', full=False):
         if self.running or self.export_busy:
             return
-        path = filedialog.asksaveasfilename(parent=self, title="Сохранить всю базу" if full else "Сохранить новые контакты",
-                    defaultextension='.' + kind, initialfile=('Все_контакты' if full else 'Новые_контакты') + '.' + kind,
+        communities_only = self.result_mode == 'communities' and not full
+        path = filedialog.asksaveasfilename(parent=self, title="Сохранить каналы и группы" if communities_only else ("Сохранить всю базу" if full else "Сохранить новые контакты"),
+                    defaultextension='.' + kind, initialfile=('Сообщества' if communities_only else ('Все_контакты' if full else 'Новые_контакты')) + '.' + kind,
                     initialdir=str(RESULTS), filetypes=[(kind.upper(), '*.' + kind)])
         if not path:
             return
-        contacts = self.selected_exports(full)
+        contacts = list(self.communities.values()) if communities_only else self.selected_exports(full)
         try:
             hours, maximum = float(self.cache_hours.get()), int(self.max_operations.get())
             if not 0 <= hours <= 8760 or not 1 <= maximum <= 10000:
@@ -945,11 +1025,11 @@ class Application(tk.Tk):
         except Exception as exc:
             messagebox.showerror('Экспорт', str(exc), parent=self)
             return
-        self.export_request = (path, kind)
+        self.export_request = (path, 'community_' + kind if communities_only else kind)
         self.export_busy = True
         self.set_running(True)
         self.status.set('Проверяю устаревшие ники перед экспортом. Непроверенные контакты не попадут в файл.')
-        self.backend.submit(self.backend.verify_export(contacts, hours, maximum), 'export_ready')
+        self.backend.submit((self.backend.verify_communities if communities_only else self.backend.verify_export)(contacts, hours, maximum), 'export_ready')
 
     def save_as(self):
         self.request_export('txt')
@@ -960,12 +1040,23 @@ class Application(tk.Tk):
     def save_history(self):
         self.request_export('txt', full=True)
 
+    def persist_search_settings(self):
+        settings = {field: getattr(self, field).get() for field in ("topic", "city", "roles", "chat_type", "max_chats", "posts", "min_members", "max_new", "max_operations", "cache_hours", "retention_days", "limit_mode")}
+        settings.update(keywords=self.keywords.get('1.0', 'end').strip(), sources=self.sources.get('1.0', 'end').strip(),
+                        check_admins=self.admins.get(), include_bots=self.bots.get())
+        atomic_text(PRIVATE / 'search_settings.json', json.dumps(settings, ensure_ascii=False, indent=2))
+
     def report_callback_exception(self, exc_type, exc, tb):
         from tgsearch.backend import record_error
         record_error('ui_callback', exc)
         messagebox.showerror('Telegram Контакты', f'Не удалось выполнить действие ({exc_type.__name__}). Данные сохранены.', parent=self)
 
     def close(self):
+        try:
+            self.persist_search_settings()
+        except (OSError, ValueError) as exc:
+            from tgsearch.backend import record_error
+            record_error('save_search_settings', exc)
         self.closing = True
         if self.running:
             self.stop_search()

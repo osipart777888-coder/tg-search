@@ -9,7 +9,7 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, types
 from telethon.tl.functions.auth import LogOutRequest
 
 from .storage import PRIVATE, load_config, save_config, redact
@@ -342,6 +342,53 @@ class Backend:
             self.emit('stats', {'operations': limiter.total, 'api_errors': limiter.errors,
                                 'categories': limiter.counts, 'export_check': True})
             self.persist_session()
+
+    async def verify_communities(self, communities, cache_hours=24, maximum=300):
+        from .control import OperationLimiter
+        from .history import timestamp
+        self.export_task = asyncio.current_task()
+        limiter = None
+        try:
+            Cooldown(PRIVATE).check()
+            client = await self.connect()
+            limiter = OperationLimiter(PRIVATE, maximum=maximum)
+            verified = []
+            with session_lock(PRIVATE, 'search.lock'), limiter.bind(client):
+                for row in communities:
+                    try:
+                        fresh = bool(row.checked_at) and 0 <= time.time() - datetime.fromisoformat(row.checked_at).timestamp() < cache_hours * 3600
+                    except ValueError:
+                        fresh = False
+                    if fresh and row.verification == 'verified':
+                        verified.append(row)
+                        continue
+                    try:
+                        entity = await limiter.call(lambda: client.get_entity(types.PeerChannel(row.community_id)), 'discovery')
+                        if not isinstance(entity, types.Channel) or entity.id != row.community_id or not entity.username:
+                            row.verification = 'incomplete'
+                        else:
+                            row.username, row.title = entity.username.lower(), entity.title
+                            row.kind = 'Канал' if entity.broadcast else 'Группа'
+                            row.members = getattr(entity, 'participants_count', None)
+                            row.link, row.checked_at = f'https://t.me/{entity.username}', timestamp()
+                            row.verification = 'verified'
+                            verified.append(row)
+                    except SearchPaused:
+                        row.verification = 'incomplete'
+                        self.emit('community_checked', row)
+                        raise
+                    except (errors.RPCError, OSError, asyncio.TimeoutError, ValueError):
+                        row.verification = 'incomplete'
+                    self.emit('community_checked', row)
+            return verified
+        except asyncio.CancelledError:
+            return None
+        finally:
+            if limiter:
+                self.emit('stats', {'operations': limiter.total, 'api_errors': limiter.errors,
+                                    'categories': limiter.counts, 'export_check': True})
+            self.persist_session()
+            self.export_task = None
 
     def stop_search(self):
         def cancel():
