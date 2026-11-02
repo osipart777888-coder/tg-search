@@ -271,7 +271,7 @@ class Application(tk.Tk):
         ttk.Label(table_frame, textvariable=self.api_stats, style="Hint.TLabel", wraplength=650).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         table_frame.rowconfigure(1, weight=1)
         table_frame.rowconfigure(0, weight=0)
-        self.table = ttk.Treeview(table_frame, columns=("username", "state", "role", "source"), show="headings", selectmode="browse", height=7)
+        self.table = ttk.Treeview(table_frame, columns=("username", "state", "role", "source"), show="headings", selectmode="extended", height=7)
         for name, label, width in [("username", "Ник", 145), ("state", "Статус", 120), ("role", "Тип / достоверность", 200), ("source", "Группа / канал", 180)]:
             self.table.heading(name, text=label)
             self.table.column(name, width=width, minwidth=90)
@@ -281,7 +281,22 @@ class Application(tk.Tk):
         self.table.configure(yscrollcommand=scrollbar.set)
         self.table.bind("<<TreeviewSelect>>", self.show_evidence)
         self.table.bind("<Double-1>", self.open_contact)
-        ttk.Label(right, text="Источник и подтверждение выбранного контакта", style="Hint.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 4))
+        self.bind_copy(self.table, self.copy_nicks)
+        self.table.bind("<<SelectAll>>", self.select_all_contacts)
+        self.table.bind("<Command-a>", self.select_all_contacts)
+        self.table.bind("<Control-a>", self.select_all_contacts)
+        table_menu = tk.Menu(self.table, tearoff=False)
+        table_menu.add_command(label="Копировать ники", command=self.copy_nicks)
+        table_menu.add_command(label="Копировать ссылки на источники", command=self.copy_sources)
+        table_menu.add_separator()
+        table_menu.add_command(label="Выделить все контакты", command=self.select_all_contacts)
+        self.bind_context_menu(self.table, table_menu, table=True)
+        evidence_header = ttk.Frame(right)
+        evidence_header.grid(row=3, column=0, sticky="ew", pady=(10, 4))
+        evidence_header.columnconfigure(0, weight=1)
+        ttk.Label(evidence_header, text="Источники выбранного контакта", style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(evidence_header, text="Копировать ник", command=self.copy_nicks).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(evidence_header, text="Копировать ссылки", command=self.copy_sources).grid(row=0, column=2, padx=(6, 0))
         self.evidence = self.output_text(right, 4)
         self.evidence.grid(row=4, column=0, sticky="ew")
         self.progress = ttk.Progressbar(right, mode="indeterminate")
@@ -473,8 +488,84 @@ class Application(tk.Tk):
         return widget
 
     def output_text(self, parent, height):
-        return tk.Text(parent, height=height, wrap="word", state="disabled", bg="white", fg=INK,
-                       relief="flat", padx=10, pady=8, font=("Helvetica Neue", 10), width=50)
+        widget = tk.Text(parent, height=height, wrap="word", state="disabled", bg="white", fg=INK,
+                         relief="flat", padx=10, pady=8, font=("Helvetica Neue", 10), width=50,
+                         exportselection=False, takefocus=True)
+        self.bind_copy(widget, lambda event=None: self.copy_text(widget))
+        widget.bind("<Button-1>", lambda event: widget.focus_set(), add=True)
+        widget.bind("<<SelectAll>>", lambda event: self.select_all_text(widget))
+        widget.bind("<Command-a>", lambda event: self.select_all_text(widget))
+        widget.bind("<Control-a>", lambda event: self.select_all_text(widget))
+        menu = tk.Menu(widget, tearoff=False)
+        menu.add_command(label="Копировать выделенное", command=lambda: self.copy_text(widget))
+        menu.add_command(label="Копировать весь текст", command=lambda: self.copy_text(widget, whole=True))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: self.select_all_text(widget))
+        self.bind_context_menu(widget, menu)
+        return widget
+
+    def bind_copy(self, widget, command):
+        widget.bind("<<Copy>>", command)
+        # Explicit bindings also cover the Russian keyboard layout on macOS.
+        for modifier in ("Command", "Control"):
+            for key in ("c", "C", "Cyrillic_es", "Cyrillic_ES"):
+                widget.bind(f"<{modifier}-Key-{key}>", command)
+
+    def bind_context_menu(self, widget, menu, table=False):
+        def popup(event):
+            widget.focus_set()
+            if table:
+                row = widget.identify_row(event.y)
+                if row and row not in widget.selection():
+                    widget.selection_set(row)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+        widget.bind("<Button-3>", popup)
+        widget.bind("<Button-2>", popup)
+        widget.bind("<Control-Button-1>", popup)
+
+    def copy_to_clipboard(self, text, label):
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+            self.add_log(label)
+        return "break"
+
+    def selected_contacts(self):
+        selected = set(self.table.selection())
+        return [self.contacts[int(row)] for row in self.table.get_children()
+                if row in selected and not row.startswith('pending:') and int(row) in self.contacts]
+
+    def copy_nicks(self, _event=None):
+        names = list(dict.fromkeys('@' + c.username for c in self.selected_contacts()))
+        if not names:
+            self.add_log("Сначала выберите контакт в таблице.")
+        return self.copy_to_clipboard("\n".join(names), f"Ники скопированы в буфер обмена: {len(names)}.")
+
+    def copy_sources(self, _event=None):
+        links = list(dict.fromkeys(e.source for c in self.selected_contacts() for e in c.evidence if e.source))
+        if not links:
+            self.add_log("Выберите контакт с источниками в таблице.")
+        return self.copy_to_clipboard("\n".join(links), "Ссылки на источники скопированы в буфер обмена.")
+
+    def copy_text(self, widget, whole=False):
+        try:
+            text = widget.get('1.0', 'end-1c') if whole else widget.get('sel.first', 'sel.last')
+        except tk.TclError:
+            return "break"
+        return self.copy_to_clipboard(text, "Выделенный текст скопирован в буфер обмена.")
+
+    def select_all_contacts(self, _event=None):
+        self.table.selection_set(self.table.get_children())
+        return "break"
+
+    def select_all_text(self, widget):
+        widget.tag_add('sel', '1.0', 'end-1c')
+        return "break"
 
     def change_topic(self, _event=None):
         self.keywords.delete("1.0", "end")
