@@ -23,6 +23,13 @@ INK = "#172d43"
 MUTED = "#62768a"
 
 
+def saved_search_target(settings):
+    target = settings.get('search_target')
+    if target in {'communities', 'contacts'}:
+        return target
+    return 'communities' if settings.get('roles', COMMUNITY_SEARCH_LABEL) == COMMUNITY_SEARCH_LABEL else 'contacts'
+
+
 def open_path(path):
     if sys.platform == "darwin":
         subprocess.Popen(["open", str(path)])
@@ -101,7 +108,7 @@ class Application(tk.Tk):
         self.tabs.pack(fill="both", expand=True, padx=18, pady=(12, 5))
         self.search_tab = ttk.Frame(self.tabs, padding=(12, 12))
         self.login_tab = ttk.Frame(self.tabs, padding=24)
-        self.tabs.add(self.search_tab, text="Поиск контактов")
+        self.tabs.add(self.search_tab, text="Поиск")
         self.tabs.add(self.login_tab, text="Вход в Telegram")
         self.build_login()
         self.build_search()
@@ -184,6 +191,8 @@ class Application(tk.Tk):
         right.columnconfigure(0, weight=1)
         right.rowconfigure(2, weight=1)
         self.topic = tk.StringVar(value="Строители")
+        self.search_target = tk.StringVar(value='communities')
+        self.target_hint = tk.StringVar()
         self.city = tk.StringVar()
         self.russia_only = tk.BooleanVar(value=False)
         self.roles = tk.StringVar(value=next(iter(ROLE_FILTERS)))
@@ -207,6 +216,14 @@ class Application(tk.Tk):
         self.stats = tk.StringVar(value=f"Новых: 0 · Найдено: 0 · В базе: {self.history.total()}")
         self.filter_widgets = []
         self.contact_only_widgets = []
+        target_panel = ttk.LabelFrame(left_panel, text='Что собирать', padding=(8, 6))
+        target_panel.pack(fill='x', pady=(0, 8), before=scroller)
+        for label, value in [('Каналы и группы (названия)', 'communities'), ('Контакты людей', 'contacts')]:
+            radio = ttk.Radiobutton(target_panel, text=label, value=value, variable=self.search_target,
+                                    command=self.select_search_target)
+            radio.pack(anchor='w', pady=2)
+            self.filter_widgets.append(radio)
+        ttk.Label(target_panel, textvariable=self.target_hint, wraplength=305, style='Hint.TLabel').pack(anchor='w', pady=(4, 0))
         ttk.Label(left, text="Настройки поиска и ограничения", font=("Helvetica Neue", 14, "bold")).pack(anchor="w", pady=(0, 10))
         self.field_label(left, "Тема")
         combo = self.combo(left, self.topic, list(PRESETS))
@@ -222,9 +239,9 @@ class Application(tk.Tk):
         russia.pack(anchor='w', pady=(7, 0))
         self.filter_widgets.append(russia)
         ttk.Label(left, text='Россия или российский регион в названии/описании. Без явного признака РФ — пропуск.', wraplength=305, style='Hint.TLabel').pack(anchor='w', pady=(3, 0))
-        self.field_label(left, "Кого искать")
-        self.roles_combo = self.combo(left, self.roles, [*ROLE_FILTERS, COMMUNITY_SEARCH_LABEL])
-        self.roles_combo.bind('<<ComboboxSelected>>', self.update_search_mode)
+        self.field_label(left, "Кого искать среди людей")
+        self.roles_combo = self.combo(left, self.roles, list(ROLE_FILTERS))
+        self.contact_only_widgets.append(self.roles_combo)
         self.mode_hint = tk.StringVar()
         ttk.Label(left, textvariable=self.mode_hint, wraplength=305, style='Hint.TLabel').pack(anchor='w', pady=(5, 0))
         grid = ttk.Frame(left)
@@ -343,16 +360,26 @@ class Application(tk.Tk):
         self.history_button = ttk.Button(buttons, text="Вся база TXT", command=self.save_history)
         self.history_button.pack(side="left", padx=(6, 0))
         ttk.Button(buttons, text="Папка", command=lambda: open_path(RESULTS), width=6).pack(side="left", padx=(6, 0))
-        self.add_log(f"В истории {self.history.total()} аккаунтов. TXT и CSV нового поиска содержат только новые контакты.")
+        self.add_log(f"В истории контактов: {self.history.total()} аккаунтов.")
         self.restore_search_settings()
         self.update_search_mode()
+        self.city.trace_add('write', lambda *_args: self.update_search_mode())
+        self.russia_only.trace_add('write', lambda *_args: self.update_search_mode())
 
     def update_search_mode(self, _event=None):
-        communities_only = self.roles.get() == COMMUNITY_SEARCH_LABEL
+        communities_only = self.search_target.get() == 'communities'
+        output = 'В TXT: названия, @ники и ссылки сообществ.' if communities_only else 'В TXT: @ники людей.'
+        self.target_hint.set(output + f'\nГород: {self.city.get().strip() or "любой"}. Только РФ: {"да" if self.russia_only.get() else "нет"}.')
         self.chat_limit_input.configure(to=10000 if communities_only else 300)
         self.mode_hint.set('Слова и город проверяются только в названии. Фильтр РФ — по названию и описанию. Результат: название, @ник и ссылка. Лимит новых контактов не применяется.' if communities_only else '')
         for widget in self.contact_only_widgets:
-            widget.configure(state='disabled' if self.running or communities_only else 'normal')
+            widget.configure(state='disabled' if self.running or communities_only else ('readonly' if isinstance(widget, ttk.Combobox) else 'normal'))
+
+    def select_search_target(self):
+        self.update_search_mode()
+        self.update_actions()
+        mode = 'названия каналов и групп' if self.search_target.get() == 'communities' else 'контакты людей'
+        self.status.set(f'Следующий поиск: {mode}. Нажмите «Начать поиск». Уже показанная выгрузка остаётся прежней.')
 
     def configure_result_mode(self, communities_only):
         self.result_mode = 'communities' if communities_only else 'contacts'
@@ -384,11 +411,15 @@ class Application(tk.Tk):
         blocked = self.running or not self.authorized
         try:
             blocked = blocked or bool(Cooldown(PRIVATE).remaining())
-            unfinished = self.history.unfinished() is not None
+            checkpoint = self.history.unfinished()
+            unfinished = checkpoint is not None
+            matching_mode = unfinished and checkpoint['options'].get('communities_only', False) == (self.search_target.get() == 'communities')
         except Exception:
-            blocked, unfinished = True, False
+            blocked, unfinished, matching_mode = True, False, False
         self.start_button.configure(state='disabled' if blocked else 'normal')
-        self.resume_button.configure(state='normal' if unfinished and not blocked else 'disabled')
+        resume_kind = 'каналы и группы' if unfinished and checkpoint['options'].get('communities_only', False) else 'контакты людей'
+        self.resume_button.configure(text=f'Продолжить: {resume_kind}' if unfinished else 'Продолжить незавершённый поиск',
+                                     state='normal' if matching_mode and not blocked else 'disabled')
         for button in getattr(self, 'data_buttons', []):
             button.configure(state='disabled' if self.running else 'normal')
 
@@ -483,6 +514,9 @@ class Application(tk.Tk):
             self.admins.set(settings.get("check_admins", True))
             self.bots.set(settings.get("include_bots", False))
             self.russia_only.set(settings.get('russia_only', False))
+            self.search_target.set(saved_search_target(settings))
+            if self.roles.get() not in ROLE_FILTERS:
+                self.roles.set(next(iter(ROLE_FILTERS)))
             for field in ("keywords", "sources"):
                 if field in settings:
                     widget = getattr(self, field)
@@ -517,6 +551,9 @@ class Application(tk.Tk):
             self.status.set('Открыта прошлая выгрузка каналов и групп. TXT содержит названия, ники и ссылки.' if communities_only else
                             f"Открыта прошлая выгрузка. В общей истории: {self.history.total()} аккаунтов. Следующий поиск сохранит только новые.")
             self.status.set(self.status.get() + (' В этой выгрузке включён фильтр РФ.' if report.get('options', {}).get('russia_only', False) else ' В этой выгрузке фильтр РФ не применялся.'))
+            if communities_only != (self.search_target.get() == 'communities'):
+                previous = 'каналов и групп' if communities_only else 'контактов людей'
+                self.status.set(f'На экране прошлый поиск {previous}. Для выбранного нового режима нажмите «Начать поиск».')
         except (OSError, ValueError, KeyError, TypeError):
             return
 
@@ -752,17 +789,14 @@ class Application(tk.Tk):
     def start_search(self, resume=False):
         if self.running or self.export_busy:
             return
+        checkpoint = self.history.unfinished() if resume else None
+        if resume and (checkpoint is None or checkpoint['options'].get('communities_only', False) != (self.search_target.get() == 'communities')):
+            self.status.set('Этот незавершённый поиск относится к другому режиму. Для выбранного режима нажмите «Начать поиск».')
+            self.add_log(self.status.get())
+            return
         try:
             Cooldown(PRIVATE).check()
-            communities_only = self.roles.get() == COMMUNITY_SEARCH_LABEL
-            options = SearchOptions(self.keywords.get("1.0", "end").strip(), ROLE_FILTERS.get(self.roles.get(), set()),
-                                    self.city.get().strip(), self.chat_type.get(), int(self.max_chats.get()),
-                                    0 if communities_only else int(self.posts.get()), int(self.min_members.get()), self.admins.get() and not communities_only,
-                                    self.bots.get() and not communities_only, self.sources.get("1.0", "end").strip(),
-                                    max_new=100 if communities_only else int(self.max_new.get()), max_operations=int(self.max_operations.get()),
-                                    cache_hours=float(self.cache_hours.get()), force_refresh=self.force_refresh.get(),
-                                    retention_days=int(self.retention_days.get()), limit_mode=self.limit_mode.get(),
-                                    communities_only=communities_only, russia_only=self.russia_only.get())
+            options = self.read_search_options()
             options.validate()
         except Exception as exc:
             self.status.set(f'Поиск не запущен: {exc}')
@@ -772,7 +806,6 @@ class Application(tk.Tk):
         self.persist_search_settings()
         self.contacts.clear()
         self.communities.clear()
-        checkpoint = self.history.unfinished() if resume else None
         self.configure_result_mode(checkpoint['options'].get('communities_only', False) if checkpoint else options.communities_only)
         self.last_path = None
         self.table.delete(*self.table.get_children())
@@ -783,6 +816,17 @@ class Application(tk.Tk):
                        f"Новых: 0 · Найдено: 0 · В базе: {self.history.total()}")
         self.set_running(True)
         self.backend.submit(self.backend.search(options, resume=resume), "finished")
+
+    def read_search_options(self):
+        communities_only = self.search_target.get() == 'communities'
+        return SearchOptions(self.keywords.get("1.0", "end").strip(), set() if communities_only else ROLE_FILTERS.get(self.roles.get(), set()),
+                                    self.city.get().strip(), self.chat_type.get(), int(self.max_chats.get()),
+                                    0 if communities_only else int(self.posts.get()), int(self.min_members.get()), self.admins.get() and not communities_only,
+                                    self.bots.get() and not communities_only, self.sources.get("1.0", "end").strip(),
+                                    max_new=100 if communities_only else int(self.max_new.get()), max_operations=int(self.max_operations.get()),
+                                    cache_hours=float(self.cache_hours.get()), force_refresh=self.force_refresh.get(),
+                                    retention_days=int(self.retention_days.get()), limit_mode=self.limit_mode.get(),
+                                    communities_only=communities_only, russia_only=self.russia_only.get())
 
     def set_running(self, running):
         self.running = running
@@ -1053,7 +1097,7 @@ class Application(tk.Tk):
     def persist_search_settings(self):
         settings = {field: getattr(self, field).get() for field in ("topic", "city", "roles", "chat_type", "max_chats", "posts", "min_members", "max_new", "max_operations", "cache_hours", "retention_days", "limit_mode")}
         settings.update(keywords=self.keywords.get('1.0', 'end').strip(), sources=self.sources.get('1.0', 'end').strip(),
-                        check_admins=self.admins.get(), include_bots=self.bots.get(), russia_only=self.russia_only.get())
+                        check_admins=self.admins.get(), include_bots=self.bots.get(), russia_only=self.russia_only.get(), search_target=self.search_target.get())
         atomic_text(PRIVATE / 'search_settings.json', json.dumps(settings, ensure_ascii=False, indent=2))
 
     def report_callback_exception(self, exc_type, exc, tb):

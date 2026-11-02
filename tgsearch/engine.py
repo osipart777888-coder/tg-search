@@ -463,6 +463,10 @@ class SearchEngine:
             self.save()
             return
         if not city_matches(self.options.city, chat.title + ' ' + about) or self.options.min_members and (count is None or count < self.options.min_members):
+            if not city_matches(self.options.city, chat.title + ' ' + about):
+                self.log(f'Пропуск @{chat.username}: город/регион «{self.options.city}» не найден в названии и описании.')
+            else:
+                self.log(f'Пропуск @{chat.username}: участников {count if count is not None else "неизвестно"}, требуется не менее {self.options.min_members}.')
             self.skipped += 1
             self.processed.add(chat.id)
             self.save()
@@ -502,10 +506,15 @@ class SearchEngine:
         if not isinstance(chat, types.Channel) or not chat.username or chat.id in self.processed:
             return
         if self.options.chat_type == 'Группы' and chat.broadcast or self.options.chat_type == 'Каналы' and not chat.broadcast:
+            self.log(f'Пропуск @{chat.username}: выбран другой тип сообщества ({self.options.chat_type}).')
             self.processed.add(chat.id)
             return
         # Telegram may match a username. Only literal title matches qualify here.
         if not title_matches(self.options.keywords, chat.title) or not city_matches(self.options.city, chat.title):
+            if not title_matches(self.options.keywords, chat.title):
+                self.log(f'Пропуск @{chat.username}: ключевые слова не совпали с названием «{chat.title}».')
+            else:
+                self.log(f'Пропуск @{chat.username}: город/регион «{self.options.city}» не найден в названии «{chat.title}».')
             self.processed.add(chat.id)
             return
         self.seen.add(chat.id)
@@ -536,6 +545,7 @@ class SearchEngine:
             self.save()
             return
         if self.options.min_members and (count is None or count < self.options.min_members):
+            self.log(f'Пропуск @{chat.username}: участников {count if count is not None else "неизвестно"}, требуется не менее {self.options.min_members}.')
             self.skipped += 1
         else:
             self.scanned_ids.add(chat.id)

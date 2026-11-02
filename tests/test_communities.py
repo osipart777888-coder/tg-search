@@ -271,7 +271,7 @@ class CommunityExportTests(unittest.IsolatedAsyncioTestCase):
 class CommunityUiTests(unittest.TestCase):
     def test_community_mode_disables_contact_only_controls(self):
         widgets = [Mock(), Mock()]
-        view = NS(roles=NS(get=lambda: COMMUNITY_SEARCH_LABEL), mode_hint=Mock(), running=False, contact_only_widgets=widgets, chat_limit_input=Mock())
+        view = NS(search_target=NS(get=lambda: 'communities'), city=NS(get=lambda: 'Челябинск'), russia_only=NS(get=lambda: True), target_hint=Mock(), mode_hint=Mock(), running=False, contact_only_widgets=widgets, chat_limit_input=Mock())
         Application.update_search_mode(view)
         for widget in widgets:
             widget.configure.assert_called_once_with(state='disabled')
@@ -291,7 +291,7 @@ class CommunityUiTests(unittest.TestCase):
                     'limit_mode': 'Остановить и сохранить'}
         view = NS(**{key: NS(get=lambda value=value: value) for key, value in settings.items()},
                   keywords=NS(get=lambda *args: 'юрист'), sources=NS(get=lambda *args: ''),
-                  admins=NS(get=lambda: True), bots=NS(get=lambda: False), russia_only=NS(get=lambda: True))
+                  admins=NS(get=lambda: True), bots=NS(get=lambda: False), russia_only=NS(get=lambda: True), search_target=NS(get=lambda: 'communities'))
         with tempfile.TemporaryDirectory() as folder, patch('app.PRIVATE', Path(folder)):
             Application.persist_search_settings(view)
             saved = json.loads((Path(folder) / 'search_settings.json').read_text())
@@ -299,3 +299,4 @@ class CommunityUiTests(unittest.TestCase):
             self.assertEqual(saved['max_chats'], '1000')
             self.assertEqual(saved['keywords'], 'юрист')
             self.assertTrue(saved['russia_only'])
+            self.assertEqual(saved['search_target'], 'communities')
