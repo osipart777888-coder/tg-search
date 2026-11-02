@@ -345,7 +345,9 @@ class Backend:
 
     async def verify_communities(self, communities, cache_hours=24, maximum=300):
         from .control import OperationLimiter
+        from .geography import russia_basis
         from .history import timestamp
+        from telethon.tl.functions.channels import GetFullChannelRequest
         self.export_task = asyncio.current_task()
         limiter = None
         try:
@@ -359,7 +361,7 @@ class Backend:
                         fresh = bool(row.checked_at) and 0 <= time.time() - datetime.fromisoformat(row.checked_at).timestamp() < cache_hours * 3600
                     except ValueError:
                         fresh = False
-                    if fresh and row.verification == 'verified':
+                    if fresh and row.verification == 'verified' and (not row.russia_only or row.russia_basis):
                         verified.append(row)
                         continue
                     try:
@@ -372,7 +374,13 @@ class Backend:
                             row.members = getattr(entity, 'participants_count', None)
                             row.link, row.checked_at = f'https://t.me/{entity.username}', timestamp()
                             row.verification = 'verified'
-                            verified.append(row)
+                            if row.russia_only:
+                                full = await limiter.call(lambda: client(GetFullChannelRequest(entity)), 'descriptions')
+                                row.russia_basis = russia_basis(entity.title, getattr(full.full_chat, 'about', '') or '')
+                                if not row.russia_basis:
+                                    row.verification = 'incomplete'
+                            if row.verification == 'verified':
+                                verified.append(row)
                     except SearchPaused:
                         row.verification = 'incomplete'
                         self.emit('community_checked', row)

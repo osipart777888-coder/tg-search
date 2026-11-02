@@ -291,10 +291,11 @@ class CommunityUiTests(unittest.TestCase):
                     'limit_mode': 'Остановить и сохранить'}
         view = NS(**{key: NS(get=lambda value=value: value) for key, value in settings.items()},
                   keywords=NS(get=lambda *args: 'юрист'), sources=NS(get=lambda *args: ''),
-                  admins=NS(get=lambda: True), bots=NS(get=lambda: False))
+                  admins=NS(get=lambda: True), bots=NS(get=lambda: False), russia_only=NS(get=lambda: True))
         with tempfile.TemporaryDirectory() as folder, patch('app.PRIVATE', Path(folder)):
             Application.persist_search_settings(view)
             saved = json.loads((Path(folder) / 'search_settings.json').read_text())
             self.assertEqual(saved['roles'], COMMUNITY_SEARCH_LABEL)
             self.assertEqual(saved['max_chats'], '1000')
             self.assertEqual(saved['keywords'], 'юрист')
+            self.assertTrue(saved['russia_only'])

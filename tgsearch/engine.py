@@ -14,6 +14,7 @@ from .control import LimitReached, OperationLimiter, SearchPaused, session_lock
 from .communities import Community, discovery_variants, export_communities_txt, title_matches
 from .extraction import ROLE_LABELS, city_matches, extract_candidates, make_queries, public_message_text
 from .history import ContactHistory, timestamp
+from .geography import russia_basis
 from .storage import PRIVATE, RESULTS, atomic_text, export_txt, prepare_storage, redact
 
 
@@ -37,6 +38,7 @@ class SearchOptions:
     limit_mode: str = "Остановить и сохранить"
     retention_days: int = 30
     communities_only: bool = False
+    russia_only: bool = False
 
     def validate(self):
         if (not self.communities_only and not self.roles) or not self.roles <= ROLE_LABELS.keys():
@@ -53,6 +55,8 @@ class SearchOptions:
         if self.limit_mode not in {"Остановить и сохранить", "Остановить и показать уведомление"} or not 1 <= self.retention_days <= 3650:
             raise ValueError("Проверьте режим остановки и срок хранения: 1–3650 дней.")
         queries = make_queries(self.keywords, self.city) if self.keywords.strip() else []
+        if self.russia_only:
+            queries = list(dict.fromkeys([f'{q} Россия' for q in queries] + queries))
         sources = []
         for term in self.sources.replace("\n", ",").replace(";", ",").split(","):
             term = term.strip().removeprefix("https://").removeprefix("http://")
@@ -279,6 +283,8 @@ class SearchEngine:
                 queries = self.discovery_queries
             self.log('Поиск каналов и групп по названию. В TXT попадут названия, ники и ссылки.' if options.communities_only else
                      'Поиск публичных контактов. История общая для всех тем; TXT содержит новые аккаунты.')
+            if options.russia_only:
+                self.log('Только РФ: проверяю название и описание. Без явного признака РФ или при смешанной географии — пропуск. Это не определение местонахождения людей.')
             self.save()
             try:
                 await self.process_queue()
@@ -450,6 +456,12 @@ class SearchEngine:
         else:
             self.log('Описание из кеша; публикации и доступные администраторы проверяются заново.')
         about, count = metadata['about'], metadata['count']
+        if self.options.russia_only and not russia_basis(chat.title, about):
+            self.log(f'Пропуск @{chat.username}: нет однозначного публичного признака РФ.')
+            self.skipped += 1
+            self.processed.add(chat.id)
+            self.save()
+            return
         if not city_matches(self.options.city, chat.title + ' ' + about) or self.options.min_members and (count is None or count < self.options.min_members):
             self.skipped += 1
             self.processed.add(chat.id)
@@ -500,26 +512,37 @@ class SearchEngine:
         self.log(f'Проверка названия: {chat.title} (@{chat.username})')
         self.save()
         count = getattr(chat, 'participants_count', None)
-        if self.options.min_members and count is None:
+        about = ''
+        if self.options.russia_only or self.options.min_members and count is None:
             metadata = None if self.options.force_refresh else self.history.cached_community(chat.id, self.options.cache_hours)
             if metadata is None:
                 try:
                     full = await self.call(lambda: self.client(GetFullChannelRequest(chat)), 'descriptions')
                 except (errors.RPCError, OSError, asyncio.TimeoutError) as exc:
-                    self.warn('Размер аудитории', exc)
+                    self.warn('Описание и размер аудитории', exc)
                     return
                 fc = full.full_chat
                 metadata = {'about': getattr(fc, 'about', '') or '', 'count': getattr(fc, 'participants_count', None),
                             'pinned_id': getattr(fc, 'pinned_msg_id', None), 'title': chat.title, 'username': chat.username}
                 self.history.cache_community(chat.id, chat.username, metadata)
-            count = metadata['count']
+            about = metadata['about']
+            if metadata['count'] is not None:
+                count = metadata['count']
+        basis = russia_basis(chat.title, about) if self.options.russia_only else ''
+        if self.options.russia_only and not basis:
+            self.log(f'Пропуск @{chat.username}: нет однозначного публичного признака РФ.')
+            self.skipped += 1
+            self.processed.add(chat.id)
+            self.save()
+            return
         if self.options.min_members and (count is None or count < self.options.min_members):
             self.skipped += 1
         else:
             self.scanned_ids.add(chat.id)
             self.scanned = len(self.scanned_ids)
             row = Community(chat.id, chat.username.lower(), chat.title, 'Канал' if chat.broadcast else 'Группа',
-                            f'https://t.me/{chat.username}', timestamp(), count)
+                            f'https://t.me/{chat.username}', timestamp(), count,
+                            russia_only=self.options.russia_only, russia_basis=basis)
             self.communities[chat.id] = row
             self.emit('community', row)
         self.processed.add(chat.id)

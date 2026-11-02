@@ -20,6 +20,8 @@ class Community:
     checked_at: str
     members: int | None = None
     verification: str = 'verified'
+    russia_only: bool = False
+    russia_basis: str = ''
 
     @property
     def status(self):
@@ -53,8 +55,8 @@ def discovery_variants(query):
 
 
 def export_communities_txt(path, communities):
-    rows = {c.community_id: c for c in communities if c.verification == 'verified'}
-    text = '\n\n'.join(f'{c.title}\n@{c.username} · {c.kind}\n{c.link}'
+    rows = {c.community_id: c for c in communities if c.verification == 'verified' and (not c.russia_only or c.russia_basis)}
+    text = '\n\n'.join(f'{c.title}\n@{c.username} · {c.kind}\n{c.link}' + (f'\nПризнак РФ — {c.russia_basis}' if c.russia_only else '')
                          for c in sorted(rows.values(), key=lambda c: (c.title.casefold(), c.community_id)))
     atomic_text(path, text + ('\n' if text else ''), 'utf-8-sig')
 
@@ -65,8 +67,8 @@ def export_communities_csv(path, communities):
         return "'" + text if text.startswith(('=', '+', '-', '@', '\t', '\r')) else text
     out = io.StringIO(newline='')
     writer = csv.writer(out, delimiter=';')
-    writer.writerow(['Название', 'Тип', 'Ник сообщества', 'Ссылка', 'Telegram ID сообщества', 'Участников', 'Последняя проверка'])
-    rows = {c.community_id: c for c in communities if c.verification == 'verified'}
+    writer.writerow(['Название', 'Тип', 'Ник сообщества', 'Ссылка', 'Telegram ID сообщества', 'Участников', 'Последняя проверка', 'Признак РФ'])
+    rows = {c.community_id: c for c in communities if c.verification == 'verified' and (not c.russia_only or c.russia_basis)}
     for c in sorted(rows.values(), key=lambda c: (c.title.casefold(), c.community_id)):
-        writer.writerow([safe(c.title), safe(c.kind), safe('@' + c.username), safe(c.link), c.community_id, c.members, c.checked_at])
+        writer.writerow([safe(c.title), safe(c.kind), safe('@' + c.username), safe(c.link), c.community_id, c.members, c.checked_at, safe(c.russia_basis)])
     atomic_text(path, out.getvalue(), 'utf-8-sig')
